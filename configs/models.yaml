@@ -1,27 +1,25 @@
 model_root: ./models
 
-models:
-  turn:
-    backend: huggingface
-    name: x2-turn
-    path: ./models/x2-turn
+asr:
+  provider: huggingface
+  model_id: example/asr-model
+  local_path: ./models/asr
+  device: cuda
 
-  asr:
-    backend: huggingface
-    name: ""
-    path: ./models/asr
+llm:
+  provider: local
+  model_id: example/llm-model
+  local_path: ./models/llm
+  device: cuda
 
-  llm:
-    backend: huggingface
-    name: ""
-    path: ./models/llm
+tts:
+  provider: modelscope
+  model_id: example/tts-model
+  local_path: ./models/tts
+  device: cpu
 
-  tts:
-    backend: modelscope
-    name: ""
-    path: ./models/tts
-
-  translation:
-    backend: huggingface
-    name: ""
-    path: ./models/translation
+translation:
+  provider: huggingface
+  model_id: example/translation-model
+  local_path: ./models/translation
+  device: cpu
