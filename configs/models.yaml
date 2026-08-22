@@ -1,8 +1,8 @@
 model_root: ./models
 
 asr:
-  provider: huggingface
-  model_id: example/asr-model
+  provider: whisper
+  model_id: example/whisper-asr
   local_path: ./models/asr
   device: cuda
 

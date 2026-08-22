@@ -14,7 +14,7 @@ class ModelDeploymentTests(unittest.TestCase):
     def test_yaml_config_parses_profiles(self):
         config = load_model_config(CONFIG_PATH)
         self.assertEqual(set(config.profiles), {"asr", "llm", "tts", "translation"})
-        self.assertEqual(config.profiles["asr"].provider, "huggingface")
+        self.assertEqual(config.profiles["asr"].provider, "whisper")
         self.assertEqual(config.profiles["tts"].provider, "modelscope")
 
     def test_local_path_resolution(self):
@@ -47,8 +47,9 @@ class ModelDeploymentTests(unittest.TestCase):
     def test_provider_profiles(self):
         config = load_model_config(CONFIG_PATH)
         resolver = ModelResolver(config, model_home=tempfile.gettempdir())
-        self.assertEqual({p.name for p in resolver.profiles(provider="huggingface")}, {"asr", "translation"})
+        self.assertEqual({p.name for p in resolver.profiles(provider="huggingface")}, {"translation"})
         self.assertEqual([p.name for p in resolver.profiles(provider="modelscope")], ["tts"])
+        self.assertEqual([p.name for p in resolver.profiles(provider="whisper")], ["asr"])
 
     def test_offline_prepare_only_creates_directories(self):
         config = load_model_config(CONFIG_PATH)

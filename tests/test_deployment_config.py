@@ -25,7 +25,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertEqual(config.model_root, "./models")
         self.assertEqual(set(config.profiles), set(MODEL_SECTIONS))
         for profile in config.profiles.values():
-            self.assertIn(profile.provider, {"huggingface", "modelscope", "local"})
+            self.assertIn(profile.provider, {"huggingface", "modelscope", "local", "whisper"})
             self.assertTrue(profile.model_id)
             self.assertTrue(profile.local_path)
 

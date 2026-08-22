@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 
-SUPPORTED_PROVIDERS = frozenset({"huggingface", "modelscope", "local"})
+SUPPORTED_PROVIDERS = frozenset({"huggingface", "modelscope", "local", "whisper"})
 REQUIRED_FIELDS = frozenset({"provider", "model_id", "local_path"})
 
 

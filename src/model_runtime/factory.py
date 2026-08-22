@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from src.adapters.asr.backend import StreamingASRBackend
+from src.adapters.asr.providers.whisper import WhisperASRProvider
 from src.adapters.llm.backend import StreamingLLMBackend
 from src.adapters.tts.backend import StreamingTTSBackend
 
@@ -23,7 +24,17 @@ class ProviderFactory:
 
     def create_asr_adapter(self, config: Any, provider: Any | None = None) -> StreamingASRBackend:
         profile = _profile(config, provider)
-        return StreamingASRBackend(profile.provider_instance, model_path=profile.model_path)
+        if profile.provider not in {"whisper", "fake", "local", "huggingface", "modelscope"}:
+            raise ValueError(f"unsupported ASR provider: {profile.provider}")
+        provider_instance = profile.provider_instance
+        if profile.provider == "whisper" and not isinstance(provider_instance, WhisperASRProvider):
+            provider_instance = WhisperASRProvider(
+                profile.model_path,
+                device=profile.device or "cpu",
+                options=profile.options,
+                runtime=provider_instance,
+            )
+        return StreamingASRBackend(provider_instance, model_path=profile.model_path)
 
     def create_llm_adapter(self, config: Any, provider: Any | None = None) -> StreamingLLMBackend:
         profile = _profile(config, provider)
@@ -42,11 +53,19 @@ def _profile(config: Any, provider: Any | None) -> "_FactoryProfile":
     elif isinstance(config, Mapping):
         provider_name = config.get("provider")
         model_path = config.get("model_path", config.get("local_path"))
-        configured_provider = config.get("provider_instance")
+        configured_provider = config.get("provider_instance", config.get("provider_runtime"))
+        device = config.get("device")
+        options = config.get("options")
     else:
         provider_name = getattr(config, "provider", None)
         model_path = getattr(config, "model_path", getattr(config, "local_path", None))
-        configured_provider = getattr(config, "provider_instance", None)
+        configured_provider = getattr(config, "provider_instance", getattr(config, "provider_runtime", None))
+        device = getattr(config, "device", None)
+        options = getattr(config, "options", None)
+
+    if isinstance(config, ModelProfile):
+        device = config.device
+        options = None
 
     if not isinstance(provider_name, str) or not provider_name.strip():
         raise ValueError("model profile must define a provider")
@@ -57,14 +76,16 @@ def _profile(config: Any, provider: Any | None) -> "_FactoryProfile":
         raise ValueError(
             f"provider instance is required for {provider_name!r}; model loading is outside the factory"
         )
-    return _FactoryProfile(provider_name, str(Path(model_path)), provider_instance)
+    return _FactoryProfile(provider_name, str(Path(model_path)), provider_instance, device, options)
 
 
 class _FactoryProfile:
-    def __init__(self, provider: str, model_path: str, provider_instance: Any) -> None:
+    def __init__(self, provider: str, model_path: str, provider_instance: Any, device: str | None, options: Any) -> None:
         self.provider = provider
         self.model_path = model_path
         self.provider_instance = provider_instance
+        self.device = device
+        self.options = options
 
 
 _FACTORY = ProviderFactory()

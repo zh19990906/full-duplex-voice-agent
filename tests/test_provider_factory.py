@@ -36,6 +36,11 @@ class ProviderFactoryTests(unittest.TestCase):
             create_asr_adapter({"model_path": "models/asr"})
         with self.assertRaises(ValueError):
             create_asr_adapter({"provider": "local"})
+        with self.assertRaises(ValueError):
+            create_asr_adapter(
+                {"provider": "not-a-provider", "model_path": "models/asr"},
+                provider=object(),
+            )
 
 
 class FakeASRProvider:
