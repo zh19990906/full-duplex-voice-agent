@@ -1,23 +1,27 @@
+model_root: ./models
+
 models:
-  turn_manager:
+  turn:
     backend: huggingface
     name: x2-turn
     path: ./models/x2-turn
 
+  asr:
+    backend: huggingface
+    name: ""
+    path: ./models/asr
+
   llm:
-    backend: local
-    name: qwen
+    backend: huggingface
+    name: ""
     path: ./models/llm
 
   tts:
-    backend: local
-    name: streaming-tts
+    backend: modelscope
+    name: ""
     path: ./models/tts
 
   translation:
-    backend: local
-    name: translation-model
+    backend: huggingface
+    name: ""
     path: ./models/translation
-
-runtime:
-  model_root: ./models

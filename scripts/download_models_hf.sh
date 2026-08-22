@@ -1,11 +1,31 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-MODEL_ROOT=${MODEL_ROOT:-./models}
-mkdir -p "$MODEL_ROOT"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="${MODEL_CONFIG:-$REPOSITORY_ROOT/configs/models.yaml}"
+MODEL_HOME="${MODEL_HOME:-$REPOSITORY_ROOT/models}"
 
-# Configure models here.
-# Example:
-# huggingface-cli download MODEL_NAME --local-dir "$MODEL_ROOT/model_name"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "ERROR: model configuration not found: $CONFIG_FILE" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required to inspect model configuration." >&2
+  exit 1
+fi
+if ! command -v hf >/dev/null 2>&1 && ! command -v huggingface-cli >/dev/null 2>&1; then
+  echo "ERROR: Hugging Face CLI not found (expected 'hf' or 'huggingface-cli')." >&2
+  exit 1
+fi
 
-echo "Download HuggingFace models into $MODEL_ROOT"
+mkdir -p "$MODEL_HOME"
+echo "Hugging Face deployment plan"
+echo "  config: $CONFIG_FILE"
+echo "  model home: $MODEL_HOME"
+echo "  no models downloaded: configure approved offline artifacts before execution"
+while IFS= read -r path; do
+  [[ -z "$path" ]] && continue
+  relative_path="${path#./models/}"
+  echo "  target: $MODEL_HOME/$relative_path"
+done < <(awk '/^[[:space:]]+path:[[:space:]]+\.\/models\// {print $2}' "$CONFIG_FILE")
