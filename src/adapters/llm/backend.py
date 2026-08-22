@@ -13,10 +13,11 @@ class StreamingLLMBackend(BaseLLMAdapter):
     Provider-specific objects remain behind this adapter boundary.
     """
 
-    def __init__(self, provider: Any) -> None:
+    def __init__(self, provider: Any, model_path: str | None = None) -> None:
         if provider is None:
             raise ValueError("an LLM provider must be supplied")
         self.provider = provider
+        self.model_path = model_path
         self._cancelled = False
 
     async def generate(self, prompt: str) -> str:

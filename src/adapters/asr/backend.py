@@ -14,10 +14,11 @@ class StreamingASRBackend(BaseASRAdapter):
     transcript results. Provider-specific objects never leave this adapter.
     """
 
-    def __init__(self, provider: Any) -> None:
+    def __init__(self, provider: Any, model_path: str | None = None) -> None:
         if provider is None:
             raise ValueError("an ASR provider must be supplied")
         self.provider = provider
+        self.model_path = model_path
         self._cancelled = False
 
     async def stream_audio(self, audio_chunk: bytes) -> Any:

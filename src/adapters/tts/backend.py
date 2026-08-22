@@ -9,10 +9,11 @@ from .base import BaseTTSAdapter
 class StreamingTTSBackend(BaseTTSAdapter):
     """Adapt an injected provider without importing a provider SDK."""
 
-    def __init__(self, provider: Any) -> None:
+    def __init__(self, provider: Any, model_path: str | None = None) -> None:
         if provider is None:
             raise ValueError("a TTS provider must be supplied")
         self.provider = provider
+        self.model_path = model_path
         self._interrupted = False
 
     async def synthesize(self, text: str) -> Any:
