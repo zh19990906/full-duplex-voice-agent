@@ -37,6 +37,10 @@ class LLMGenerationPipeline:
         if self.session is not None and self.session.status is GenerationSessionStatus.RUNNING:
             await self.cancel_generation()
 
+        reset = getattr(self.adapter, "reset", None)
+        if callable(reset):
+            reset()
+
         session_id = session_id or uuid4().hex
         self.session = GenerationSession(
             session_id=session_id,
@@ -50,7 +54,7 @@ class LLMGenerationPipeline:
 
     async def stream_tokens(self) -> tuple[TokenChunk, ...]:
         """Collect and return token chunks while respecting cancellation."""
-        self._require_running_session()
+        session = self._require_running_session()
         result = self.adapter.stream_tokens(self._prompt)
         if inspect.isawaitable(result):
             result = await result
@@ -58,12 +62,12 @@ class LLMGenerationPipeline:
         chunks: list[TokenChunk] = []
         if hasattr(result, "__aiter__"):
             async for item in result:
-                if not self._is_running():
+                if not self._is_current_session(session):
                     break
                 chunks.append(self._normalize_token(item))
         else:
             for item in self._iter_result(result):
-                if not self._is_running():
+                if not self._is_current_session(session):
                     break
                 chunks.append(self._normalize_token(item))
         return tuple(chunks)
@@ -71,8 +75,8 @@ class LLMGenerationPipeline:
     async def cancel_generation(self) -> GenerationSession:
         """Cancel adapter output and the matching GenerationManager session."""
         session = self._require_running_session()
-        await self.adapter.cancel()
         session.status = GenerationSessionStatus.CANCELLED
+        await self.adapter.cancel()
         await self.generation_manager.cancel_current()
         return session
 
@@ -92,8 +96,8 @@ class LLMGenerationPipeline:
             raise RuntimeError("generation session is not running")
         return self.session
 
-    def _is_running(self) -> bool:
-        return self.session is not None and self.session.status is GenerationSessionStatus.RUNNING
+    def _is_current_session(self, session: GenerationSession) -> bool:
+        return self.session is session and session.status is GenerationSessionStatus.RUNNING
 
     @staticmethod
     def _iter_result(result: Any) -> Iterable[Any]:

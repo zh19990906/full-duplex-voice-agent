@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 from src.adapters.llm.base import BaseLLMAdapter
+from src.adapters.llm.backend import StreamingLLMBackend
 from src.generation.manager import GenerationManager
 from src.llm_runtime.pipeline import LLMGenerationPipeline
 from src.llm_runtime.session import GenerationSession, GenerationSessionStatus
@@ -41,6 +42,23 @@ class BlockingLLMAdapter(FakeLLMAdapter):
             yield "second"
 
         return token_stream()
+
+
+class FakeProvider:
+    def __init__(self):
+        self.prompts = []
+        self.cancelled = False
+
+    async def stream_tokens(self, prompt):
+        self.prompts.append(prompt)
+        return ["partial", {"text": "", "is_final": True}]
+
+    async def generate(self, prompt):
+        self.prompts.append(prompt)
+        return "complete"
+
+    async def cancel(self):
+        self.cancelled = True
 
 
 class LLMRuntimeTest(unittest.IsolatedAsyncioTestCase):
@@ -117,6 +135,44 @@ class LLMRuntimeTest(unittest.IsolatedAsyncioTestCase):
         await pipeline.stream_tokens()
 
         self.assertEqual(adapter.prompts, ["question"])
+
+    async def test_streaming_backend_wraps_fake_provider(self):
+        provider = FakeProvider()
+        adapter = StreamingLLMBackend(provider)
+        pipeline = LLMGenerationPipeline(adapter)
+        await pipeline.start_generation("session-1", "question")
+
+        chunks = await pipeline.stream_tokens()
+
+        self.assertEqual([chunk.text for chunk in chunks], ["partial", ""])
+        self.assertTrue(chunks[-1].is_final)
+        self.assertEqual(provider.prompts, ["question"])
+
+    async def test_backend_cancellation_stops_future_prompts(self):
+        provider = FakeProvider()
+        adapter = StreamingLLMBackend(provider)
+
+        await adapter.stream_tokens("before")
+        await adapter.cancel()
+
+        with self.assertRaises(RuntimeError):
+            await adapter.stream_tokens("after")
+        self.assertTrue(provider.cancelled)
+
+    async def test_new_session_drops_old_inflight_token_stream(self):
+        manager = GenerationManager()
+        adapter = BlockingLLMAdapter()
+        pipeline = LLMGenerationPipeline(adapter, manager)
+        await pipeline.start_generation("session-1", "first")
+
+        old_stream = asyncio.create_task(pipeline.stream_tokens())
+        await adapter.first_token.wait()
+        await pipeline.start_generation("session-2", "second")
+        adapter.release.set()
+
+        old_chunks = await old_stream
+
+        self.assertEqual([chunk.text for chunk in old_chunks], ["first"])
 
 
 if __name__ == "__main__":
