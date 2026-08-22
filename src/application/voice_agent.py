@@ -12,6 +12,8 @@ from src.generation.manager import GenerationManager
 from src.memory.context import ContextBuilder
 from src.memory.manager import MemoryManager
 from src.runtime.event_bus import EventBus
+from src.tools.models import ToolRequest, ToolResult
+from src.tools.router import ToolRouter
 
 from .actions_executor import ActionExecutor
 
@@ -33,6 +35,7 @@ class VoiceAgent:
         memory_manager: MemoryManager | None = None,
         memory_session_id: str = "default",
         context_builder: ContextBuilder | None = None,
+        tool_router: ToolRouter | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.controller = controller
@@ -44,6 +47,7 @@ class VoiceAgent:
             ContextBuilder(memory_manager) if memory_manager is not None else None
         )
         self.generation_context = ()
+        self.tool_router = tool_router
         self._started = False
 
     async def start(self) -> None:
@@ -79,6 +83,13 @@ class VoiceAgent:
                 )
                 self.generation_context = self.context_builder.build(self.memory_session_id)
         return actions
+
+    async def execute_tool(self, request: ToolRequest | dict[str, object]) -> ToolResult:
+        """Execute one application tool decision through the configured router."""
+
+        if self.tool_router is None:
+            raise RuntimeError("tool calling is not configured")
+        return await self.tool_router.route(request)
 
     def record_assistant_response(
         self,
