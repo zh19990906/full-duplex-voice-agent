@@ -15,7 +15,7 @@ class ModelDeploymentTests(unittest.TestCase):
         config = load_model_config(CONFIG_PATH)
         self.assertEqual(set(config.profiles), {"asr", "llm", "tts", "translation"})
         self.assertEqual(config.profiles["asr"].provider, "whisper")
-        self.assertEqual(config.profiles["tts"].provider, "modelscope")
+        self.assertEqual(config.profiles["tts"].provider, "cosyvoice")
 
     def test_local_path_resolution(self):
         config = load_model_config(CONFIG_PATH)
@@ -48,7 +48,8 @@ class ModelDeploymentTests(unittest.TestCase):
         config = load_model_config(CONFIG_PATH)
         resolver = ModelResolver(config, model_home=tempfile.gettempdir())
         self.assertEqual({p.name for p in resolver.profiles(provider="huggingface")}, {"translation"})
-        self.assertEqual([p.name for p in resolver.profiles(provider="modelscope")], ["tts"])
+        self.assertEqual([p.name for p in resolver.profiles(provider="modelscope")], [])
+        self.assertEqual([p.name for p in resolver.profiles(provider="cosyvoice")], ["tts"])
         self.assertEqual([p.name for p in resolver.profiles(provider="whisper")], ["asr"])
         self.assertEqual([p.name for p in resolver.profiles(provider="llama_cpp")], ["llm"])
 

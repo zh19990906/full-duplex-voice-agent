@@ -16,6 +16,7 @@ from src.adapters.asr.providers.whisper import WhisperASRProvider
 from src.adapters.llm.backend import StreamingLLMBackend
 from src.adapters.llm.providers.llama_cpp import LlamaCppLLMProvider
 from src.adapters.tts.backend import StreamingTTSBackend
+from src.adapters.tts.providers.cosyvoice import CosyVoiceTTSProvider
 
 from .resolver import ModelProfile
 
@@ -53,7 +54,17 @@ class ProviderFactory:
 
     def create_tts_adapter(self, config: Any, provider: Any | None = None) -> StreamingTTSBackend:
         profile = _profile(config, provider)
-        return StreamingTTSBackend(profile.provider_instance, model_path=profile.model_path)
+        if profile.provider not in {"cosyvoice", "fake", "local", "huggingface", "modelscope", "xtts", "vits"}:
+            raise ValueError(f"unsupported TTS provider: {profile.provider}")
+        provider_instance = profile.provider_instance
+        if profile.provider == "cosyvoice" and not isinstance(provider_instance, CosyVoiceTTSProvider):
+            provider_instance = CosyVoiceTTSProvider(
+                profile.model_path,
+                device=profile.device or "cpu",
+                options=profile.options,
+                runtime=provider_instance,
+            )
+        return StreamingTTSBackend(provider_instance, model_path=profile.model_path)
 
 
 def _profile(config: Any, provider: Any | None) -> "_FactoryProfile":

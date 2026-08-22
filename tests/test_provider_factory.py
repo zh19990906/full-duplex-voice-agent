@@ -41,6 +41,11 @@ class ProviderFactoryTests(unittest.TestCase):
                 {"provider": "not-a-provider", "model_path": "models/asr"},
                 provider=object(),
             )
+        with self.assertRaises(ValueError):
+            create_tts_adapter(
+                {"provider": "not-a-provider", "model_path": "models/tts"},
+                provider=object(),
+            )
 
 
 class FakeASRProvider:

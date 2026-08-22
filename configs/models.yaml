@@ -13,8 +13,8 @@ llm:
   device: cuda
 
 tts:
-  provider: modelscope
-  model_id: example/tts-model
+  provider: cosyvoice
+  model_id: example/cosyvoice-tts
   local_path: ./models/tts
   device: cpu
 

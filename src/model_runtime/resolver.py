@@ -15,7 +15,7 @@ from typing import Iterable, Mapping
 
 
 SUPPORTED_PROVIDERS = frozenset({
-    "huggingface", "modelscope", "local", "whisper", "llama_cpp",
+    "huggingface", "modelscope", "local", "whisper", "llama_cpp", "cosyvoice",
 })
 REQUIRED_FIELDS = frozenset({"provider", "model_id", "local_path"})
 
