@@ -1,0 +1,8 @@
+audio:
+  input_provider: sounddevice
+  output_provider: sounddevice
+
+models:
+  asr: whisper
+  llm: llama_cpp
+  tts: cosyvoice
