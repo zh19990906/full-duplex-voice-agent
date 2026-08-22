@@ -2,7 +2,7 @@
 
 import inspect
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterable, Awaitable, Callable, Mapping
 from typing import Any
 
 from src.adapters.asr.base import BaseASRAdapter
@@ -36,6 +36,11 @@ class ASRPipeline:
 
     async def start_session(self, session_id: str, language: str) -> ASRSession:
         """Create and activate a streaming ASR session."""
+        if self.session is not None and self.session.status is ASRSessionStatus.RUNNING:
+            await self.stop_session()
+        reset = getattr(self.adapter, "reset", None)
+        if callable(reset):
+            reset()
         self.session = ASRSession(
             session_id=session_id,
             language=language,
@@ -46,25 +51,34 @@ class ASRPipeline:
 
     async def push_audio(self, audio: bytes | AudioFrame) -> tuple[BaseEvent, ...]:
         """Send audio to the adapter and convert returned chunks to events."""
-        self._require_running_session()
+        session = self._require_running_session()
         audio_chunk = audio.data if isinstance(audio, AudioFrame) else audio
         result = await self.adapter.stream_audio(audio_chunk)
-        chunks = self._normalize_result(result)
         events: list[BaseEvent] = []
-        for chunk in chunks:
-            event = self._event_for_chunk(chunk)
-            self.emitted_events.append(event)
-            events.append(event)
-            if self.event_handler is not None:
-                handled = self.event_handler(event)
-                if inspect.isawaitable(handled):
-                    await handled
+        async for item in self._iter_result(result):
+            if not self._is_current_running_session(session):
+                break
+            for chunk in self._normalize_result(item):
+                if not self._is_current_running_session(session):
+                    break
+                event = self._event_for_chunk(chunk)
+                self.emitted_events.append(event)
+                events.append(event)
+                if self.event_handler is not None:
+                    handled = self.event_handler(event)
+                    if inspect.isawaitable(handled):
+                        await handled
         return tuple(events)
 
     async def stop_session(self) -> ASRSession:
         """Stop accepting audio for the current session."""
         session = self._require_session()
         session.status = ASRSessionStatus.STOPPED
+        cancel = getattr(self.adapter, "cancel", None)
+        if callable(cancel):
+            result = cancel()
+            if inspect.isawaitable(result):
+                await result
         return session
 
     async def complete_session(self) -> ASRSession:
@@ -83,6 +97,9 @@ class ASRPipeline:
         if session.status is not ASRSessionStatus.RUNNING:
             raise RuntimeError("ASR session is not running")
         return session
+
+    def _is_current_running_session(self, session: ASRSession) -> bool:
+        return self.session is session and session.status is ASRSessionStatus.RUNNING
 
     def _event_for_chunk(self, chunk: TranscriptChunk) -> BaseEvent:
         session = self._require_running_session()
@@ -128,6 +145,21 @@ class ASRPipeline:
                 ),
             )
         raise TypeError("ASR adapter result must be text, mapping, chunk, or None")
+
+    @staticmethod
+    async def _iter_result(result: Any) -> AsyncIterable[Any]:
+        """Yield normal or async adapter output one item at a time."""
+        if result is None:
+            return
+        if hasattr(result, "__aiter__"):
+            async for item in result:
+                yield item
+            return
+        if isinstance(result, (list, tuple)):
+            for item in result:
+                yield item
+            return
+        yield result
 
 
 StreamingASRPipeline = ASRPipeline
