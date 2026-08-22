@@ -1,0 +1,4 @@
+memory:
+  provider: in_memory
+  short_term:
+    max_messages: 20

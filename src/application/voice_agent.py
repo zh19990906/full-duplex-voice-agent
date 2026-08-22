@@ -9,6 +9,8 @@ from src.core.events.events import (
     UserTurnEndEvent,
 )
 from src.generation.manager import GenerationManager
+from src.memory.context import ContextBuilder
+from src.memory.manager import MemoryManager
 from src.runtime.event_bus import EventBus
 
 from .actions_executor import ActionExecutor
@@ -28,11 +30,20 @@ class VoiceAgent:
         event_bus: EventBus,
         controller: ConversationController,
         generation_manager: GenerationManager,
+        memory_manager: MemoryManager | None = None,
+        memory_session_id: str = "default",
+        context_builder: ContextBuilder | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.controller = controller
         self.generation_manager = generation_manager
         self.action_executor = ActionExecutor(generation_manager)
+        self.memory_manager = memory_manager
+        self.memory_session_id = memory_session_id
+        self.context_builder = context_builder or (
+            ContextBuilder(memory_manager) if memory_manager is not None else None
+        )
+        self.generation_context = ()
         self._started = False
 
     async def start(self) -> None:
@@ -55,4 +66,42 @@ class VoiceAgent:
         """Transform one event through the controller and execute its actions."""
         actions = self.controller.handle_event(event)
         await self.action_executor.execute(actions)
+        if isinstance(event, UserTurnEndEvent) and self.memory_manager is not None:
+            text = event.payload.get("text")
+            if isinstance(text, str) and text:
+                self._ensure_memory_session()
+                self.memory_manager.add_message(
+                    self.memory_session_id,
+                    "user",
+                    text,
+                    timestamp=event.timestamp,
+                    metadata={"session_id": self.memory_session_id, "source": event.source},
+                )
+                self.generation_context = self.context_builder.build(self.memory_session_id)
         return actions
+
+    def record_assistant_response(
+        self,
+        content: str,
+        timestamp: float | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Store a completed assistant response for the next generation."""
+
+        if self.memory_manager is None:
+            raise RuntimeError("conversation memory is not configured")
+        self._ensure_memory_session()
+        self.memory_manager.add_message(
+            self.memory_session_id,
+            "assistant",
+            content,
+            timestamp=timestamp,
+            metadata={"session_id": self.memory_session_id, **(metadata or {})},
+        )
+        self.generation_context = self.context_builder.build(self.memory_session_id)
+
+    def _ensure_memory_session(self) -> None:
+        try:
+            self.memory_manager.get_session(self.memory_session_id)
+        except KeyError:
+            self.memory_manager.create_session(self.memory_session_id)
