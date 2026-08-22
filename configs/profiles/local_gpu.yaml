@@ -1,0 +1,19 @@
+audio:
+  input_provider: sounddevice
+  output_provider: sounddevice
+  input:
+    provider: sounddevice
+  output:
+    provider: sounddevice
+
+models:
+  asr:
+    provider: whisper
+  llm:
+    provider: llama_cpp
+  tts:
+    provider: cosyvoice
+
+runtime:
+  environment: local_gpu
+  debug: false

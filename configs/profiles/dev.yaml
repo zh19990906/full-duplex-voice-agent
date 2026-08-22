@@ -1,0 +1,19 @@
+audio:
+  input_provider: fake
+  output_provider: fake
+  input:
+    provider: fake
+  output:
+    provider: fake
+
+models:
+  asr:
+    provider: fake
+  llm:
+    provider: fake
+  tts:
+    provider: fake
+
+runtime:
+  environment: development
+  debug: true
