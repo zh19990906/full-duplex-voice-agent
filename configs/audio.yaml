@@ -1,0 +1,9 @@
+audio:
+  input:
+    provider: sounddevice
+    sample_rate: 16000
+    channels: 1
+  output:
+    provider: sounddevice
+    sample_rate: 24000
+    channels: 1
