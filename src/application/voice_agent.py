@@ -14,6 +14,7 @@ from src.memory.manager import MemoryManager
 from src.runtime.event_bus import EventBus
 from src.tools.models import ToolRequest, ToolResult
 from src.tools.router import ToolRouter
+from src.agent.loop import AgentLoop
 
 from .actions_executor import ActionExecutor
 
@@ -36,6 +37,7 @@ class VoiceAgent:
         memory_session_id: str = "default",
         context_builder: ContextBuilder | None = None,
         tool_router: ToolRouter | None = None,
+        agent_loop: AgentLoop | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.controller = controller
@@ -48,6 +50,7 @@ class VoiceAgent:
         )
         self.generation_context = ()
         self.tool_router = tool_router
+        self.agent_loop = agent_loop
         self._started = False
 
     async def start(self) -> None:
@@ -90,6 +93,13 @@ class VoiceAgent:
         if self.tool_router is None:
             raise RuntimeError("tool calling is not configured")
         return await self.tool_router.route(request)
+
+    async def run_agent(self, user_input: str) -> str:
+        """Run the configured autonomous tool-use loop."""
+
+        if self.agent_loop is None:
+            raise RuntimeError("agent loop is not configured")
+        return await self.agent_loop.run(user_input)
 
     def record_assistant_response(
         self,
