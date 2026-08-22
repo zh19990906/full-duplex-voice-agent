@@ -5,21 +5,25 @@ asr:
   model_id: example/whisper-asr
   local_path: ./models/asr
   device: cuda
+  auto_load: true
 
 llm:
   provider: llama_cpp
   model_id: example/llama-cpp-llm
   local_path: ./models/llm
   device: cuda
+  auto_load: true
 
 tts:
   provider: cosyvoice
   model_id: example/cosyvoice-tts
   local_path: ./models/tts
   device: cpu
+  auto_load: false
 
 translation:
   provider: huggingface
   model_id: example/translation-model
   local_path: ./models/translation
   device: cpu
+  auto_load: false

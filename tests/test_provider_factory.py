@@ -9,6 +9,7 @@ from src.model_runtime.factory import (
     create_llm_adapter,
     create_tts_adapter,
 )
+from src.model_runtime.lifecycle import ModelLifecycleManager, ModelState
 
 
 class ProviderFactoryTests(unittest.TestCase):
@@ -30,6 +31,21 @@ class ProviderFactoryTests(unittest.TestCase):
         self.assertIsInstance(create_asr_adapter(profile), StreamingASRBackend)
         self.assertIsInstance(create_llm_adapter(profile), StreamingLLMBackend)
         self.assertIsInstance(create_tts_adapter(profile), StreamingTTSBackend)
+
+    def test_factory_can_register_without_loading(self):
+        manager = ModelLifecycleManager()
+        provider = object()
+        create_asr_adapter(
+            {
+                "name": "asr",
+                "provider": "fake",
+                "model_path": "models/asr",
+                "provider_instance": provider,
+                "auto_load": True,
+            },
+            lifecycle_manager=manager,
+        )
+        self.assertEqual(manager.status("asr"), ModelState.REGISTERED)
 
     def test_invalid_provider_profile_fails_clearly(self):
         with self.assertRaises(ValueError):

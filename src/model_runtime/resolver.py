@@ -29,6 +29,7 @@ class ModelProfile:
     model_id: str
     local_path: str
     device: str | None = None
+    auto_load: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,12 +97,16 @@ def load_model_config(path: str | Path) -> ModelConfig:
             raise ValueError(f"unsupported provider {provider!r} for profile {name!r}")
         if Path(values["local_path"]).is_absolute():
             raise ValueError(f"local_path for {name!r} must be relative")
+        auto_load = values.get("auto_load", "false").lower()
+        if auto_load not in {"true", "false"}:
+            raise ValueError(f"auto_load for {name!r} must be true or false")
         profiles[name] = ModelProfile(
             name=name,
             provider=provider,
             model_id=values["model_id"],
             local_path=values["local_path"],
             device=values.get("device"),
+            auto_load=auto_load == "true",
         )
     return ModelConfig(model_root=model_root, profiles=profiles)
 
