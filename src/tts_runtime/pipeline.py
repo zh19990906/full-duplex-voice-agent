@@ -1,5 +1,6 @@
 """Model-independent streaming TTS pipeline."""
 
+import asyncio
 import inspect
 import time
 from collections.abc import AsyncIterable, Mapping
@@ -28,6 +29,7 @@ class TTSRuntimePipeline:
         self.session: TTSSession | None = None
         self._audio_queue: list[AudioFrame] = []
         self._chunk_number = 0
+        self._stream_task: asyncio.Task[Any] | None = None
 
     async def start_session(self, session_id: str) -> TTSSession:
         """Create a running TTS session and reset adapter state."""
@@ -49,20 +51,28 @@ class TTSRuntimePipeline:
         """Synthesize one text/token update and queue resulting audio frames."""
         session = self._require_running_session()
         source_text = text.text if isinstance(text, TokenChunk) else text
-        await self.adapter.synthesize(source_text)
-        result = self.adapter.stream_audio(source_text)
-        if inspect.isawaitable(result):
-            result = await result
-
         chunks: list[AudioChunk] = []
-        async for item in self._iter_result(result):
-            if not self._is_current_running_session(session):
-                break
-            for chunk in self._normalize_result(item):
+        current_task = asyncio.current_task()
+        self._stream_task = current_task
+        try:
+            await self.adapter.synthesize(source_text)
+            result = self.adapter.stream_audio(source_text)
+            if inspect.isawaitable(result):
+                result = await result
+
+            async for item in self._iter_result(result):
                 if not self._is_current_running_session(session):
                     break
-                chunks.append(chunk)
-                self._audio_queue.append(self._to_audio_frame(chunk))
+                for chunk in self._normalize_result(item):
+                    if not self._is_current_running_session(session):
+                        break
+                    chunks.append(chunk)
+                    self._audio_queue.append(self._to_audio_frame(chunk))
+        except asyncio.CancelledError:
+            return tuple(chunks)
+        finally:
+            if self._stream_task is current_task:
+                self._stream_task = None
         return tuple(chunks)
 
     async def stream_audio(self) -> tuple[AudioFrame, ...]:
@@ -77,6 +87,10 @@ class TTSRuntimePipeline:
         session.status = TTSSessionStatus.INTERRUPTED
         session.interrupted_at = session.interrupted_at or time.time()
         self._audio_queue.clear()
+        stream_task = self._stream_task
+        if stream_task is not None and stream_task is not asyncio.current_task():
+            stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
         await self.adapter.interrupt()
         return session
 

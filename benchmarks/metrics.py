@@ -23,6 +23,9 @@ METRIC_EVENTS: Mapping[str, tuple[str, str]] = {
         "backchannel_received",
         "generation_continued",
     ),
+    "startup_latency_ms": ("startup_started", "runtime_ready"),
+    "audio_buffer_wait_ms": ("audio_frame_enqueued", "audio_frame_routed"),
+    "token_queue_wait_ms": ("token_enqueued", "token_synthesized"),
 }
 
 

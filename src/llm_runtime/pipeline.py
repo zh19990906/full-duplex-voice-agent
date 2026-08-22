@@ -1,5 +1,6 @@
 """Model-independent streaming LLM generation pipeline."""
 
+import asyncio
 import inspect
 import time
 from collections.abc import AsyncIterable, Iterable, Mapping
@@ -27,6 +28,7 @@ class LLMGenerationPipeline:
         self._manager_session_id: str | None = None
         self._prompt = ""
         self._chunk_number = 0
+        self._stream_task: asyncio.Task[Any] | None = None
 
     async def start_generation(
         self,
@@ -55,27 +57,39 @@ class LLMGenerationPipeline:
     async def stream_tokens(self) -> tuple[TokenChunk, ...]:
         """Collect and return token chunks while respecting cancellation."""
         session = self._require_running_session()
-        result = self.adapter.stream_tokens(self._prompt)
-        if inspect.isawaitable(result):
-            result = await result
-
         chunks: list[TokenChunk] = []
-        if hasattr(result, "__aiter__"):
-            async for item in result:
-                if not self._is_current_session(session):
-                    break
-                chunks.append(self._normalize_token(item))
-        else:
-            for item in self._iter_result(result):
-                if not self._is_current_session(session):
-                    break
-                chunks.append(self._normalize_token(item))
+        current_task = asyncio.current_task()
+        self._stream_task = current_task
+        try:
+            result = self.adapter.stream_tokens(self._prompt)
+            if inspect.isawaitable(result):
+                result = await result
+
+            if hasattr(result, "__aiter__"):
+                async for item in result:
+                    if not self._is_current_session(session):
+                        break
+                    chunks.append(self._normalize_token(item))
+            else:
+                for item in self._iter_result(result):
+                    if not self._is_current_session(session):
+                        break
+                    chunks.append(self._normalize_token(item))
+        except asyncio.CancelledError:
+            return tuple(chunks)
+        finally:
+            if self._stream_task is current_task:
+                self._stream_task = None
         return tuple(chunks)
 
     async def cancel_generation(self) -> GenerationSession:
         """Cancel adapter output and the matching GenerationManager session."""
         session = self._require_running_session()
         session.status = GenerationSessionStatus.CANCELLED
+        stream_task = self._stream_task
+        if stream_task is not None and stream_task is not asyncio.current_task():
+            stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
         await self.adapter.cancel()
         await self.generation_manager.cancel_current()
         return session

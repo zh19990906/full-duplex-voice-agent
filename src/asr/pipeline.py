@@ -1,5 +1,6 @@
 """Model-independent streaming ASR pipeline."""
 
+import asyncio
 import inspect
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable, Mapping
@@ -33,6 +34,7 @@ class ASRPipeline:
         self.session: ASRSession | None = None
         self.emitted_events: list[BaseEvent] = []
         self._chunk_number = 0
+        self._stream_task: asyncio.Task[Any] | None = None
 
     async def start_session(self, session_id: str, language: str) -> ASRSession:
         """Create and activate a streaming ASR session."""
@@ -53,27 +55,41 @@ class ASRPipeline:
         """Send audio to the adapter and convert returned chunks to events."""
         session = self._require_running_session()
         audio_chunk = audio.data if isinstance(audio, AudioFrame) else audio
-        result = await self.adapter.stream_audio(audio_chunk)
         events: list[BaseEvent] = []
-        async for item in self._iter_result(result):
-            if not self._is_current_running_session(session):
-                break
-            for chunk in self._normalize_result(item):
+        current_task = asyncio.current_task()
+        self._stream_task = current_task
+        try:
+            result = await self.adapter.stream_audio(audio_chunk)
+            async for item in self._iter_result(result):
                 if not self._is_current_running_session(session):
                     break
-                event = self._event_for_chunk(chunk)
-                self.emitted_events.append(event)
-                events.append(event)
-                if self.event_handler is not None:
-                    handled = self.event_handler(event)
-                    if inspect.isawaitable(handled):
-                        await handled
+                for chunk in self._normalize_result(item):
+                    if not self._is_current_running_session(session):
+                        break
+                    event = self._event_for_chunk(chunk)
+                    self.emitted_events.append(event)
+                    events.append(event)
+                    if self.event_handler is not None:
+                        handled = self.event_handler(event)
+                        if inspect.isawaitable(handled):
+                            await handled
+        except asyncio.CancelledError:
+            # Cancellation is a normal interruption boundary; already emitted
+            # events remain observable, while no late provider result escapes.
+            return tuple(events)
+        finally:
+            if self._stream_task is current_task:
+                self._stream_task = None
         return tuple(events)
 
     async def stop_session(self) -> ASRSession:
         """Stop accepting audio for the current session."""
         session = self._require_session()
         session.status = ASRSessionStatus.STOPPED
+        stream_task = self._stream_task
+        if stream_task is not None and stream_task is not asyncio.current_task():
+            stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
         cancel = getattr(self.adapter, "cancel", None)
         if callable(cancel):
             result = cancel()
