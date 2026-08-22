@@ -7,8 +7,8 @@ asr:
   device: cuda
 
 llm:
-  provider: local
-  model_id: example/llm-model
+  provider: llama_cpp
+  model_id: example/llama-cpp-llm
   local_path: ./models/llm
   device: cuda
 

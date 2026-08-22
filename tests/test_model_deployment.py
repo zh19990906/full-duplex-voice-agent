@@ -50,6 +50,7 @@ class ModelDeploymentTests(unittest.TestCase):
         self.assertEqual({p.name for p in resolver.profiles(provider="huggingface")}, {"translation"})
         self.assertEqual([p.name for p in resolver.profiles(provider="modelscope")], ["tts"])
         self.assertEqual([p.name for p in resolver.profiles(provider="whisper")], ["asr"])
+        self.assertEqual([p.name for p in resolver.profiles(provider="llama_cpp")], ["llm"])
 
     def test_offline_prepare_only_creates_directories(self):
         config = load_model_config(CONFIG_PATH)
