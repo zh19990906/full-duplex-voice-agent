@@ -1,0 +1,23 @@
+audio:
+  input_provider: sounddevice
+  output_provider: sounddevice
+  input:
+    provider: sounddevice
+  output:
+    provider: sounddevice
+
+models:
+  asr:
+    provider: whisper
+    auto_load: true
+  llm:
+    provider: llama_cpp
+    auto_load: true
+  tts:
+    provider: cosyvoice
+    auto_load: true
+
+runtime:
+  environment: hardware_benchmark
+  debug: false
+  benchmark: true

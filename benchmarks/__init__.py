@@ -2,7 +2,7 @@
 
 from .evaluator import BenchmarkResult, evaluate
 from .metrics import calculate_metrics, latency_ms
-from .report import BenchmarkReport
+from .report import BenchmarkReport, HardwareBenchmarkReport
 from .runner import run_benchmark
 from .scenarios import BenchmarkScenario, load_scenarios
 from .timeline import BenchmarkTimeline
@@ -12,6 +12,7 @@ __all__ = [
     "BenchmarkScenario",
     "evaluate",
     "BenchmarkReport",
+    "HardwareBenchmarkReport",
     "BenchmarkTimeline",
     "calculate_metrics",
     "latency_ms",
