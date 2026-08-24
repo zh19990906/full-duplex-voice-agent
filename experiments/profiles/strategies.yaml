@@ -1,0 +1,12 @@
+memory:
+  recent_10:
+    max_messages: 10
+  recent_20:
+    max_messages: 20
+  recent_50:
+    max_messages: 50
+tools:
+  disabled:
+    enabled: false
+  calculator:
+    enabled: calculator

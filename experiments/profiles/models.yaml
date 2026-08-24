@@ -1,0 +1,9 @@
+profiles:
+  baseline:
+    asr: asr
+    llm: llm
+    tts: tts
+  concise:
+    asr: asr
+    llm: llm
+    tts: tts

@@ -1,0 +1,7 @@
+prompts:
+  v1:
+    version: v1
+    system: You are a helpful voice assistant.
+  v2:
+    version: v2
+    system: You are a concise assistant.

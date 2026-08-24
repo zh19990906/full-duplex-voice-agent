@@ -1,0 +1,19 @@
+variants:
+  baseline:
+    model:
+      profile: baseline
+    prompt:
+      version: v1
+    memory:
+      strategy: recent_20
+    tools:
+      profile: calculator
+  concise:
+    model:
+      profile: concise
+    prompt:
+      version: v2
+    memory:
+      strategy: recent_10
+    tools:
+      profile: disabled
