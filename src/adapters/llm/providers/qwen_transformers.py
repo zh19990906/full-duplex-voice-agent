@@ -168,7 +168,10 @@ class _TransformersRuntime:
     def __init__(self, tokenizer: Any, model: Any, **generation_options: Any) -> None:
         self.tokenizer = tokenizer
         self.model = model
-        self.generation_options = generation_options
+        nested_options = generation_options.pop("model_options", {})
+        if not isinstance(nested_options, Mapping):
+            raise TypeError("model_options must be a mapping")
+        self.generation_options = {**dict(nested_options), **generation_options}
         self._cancelled = False
 
     async def stream_tokens(self, prompt: str, **options: Any) -> AsyncIterable[TokenChunk]:

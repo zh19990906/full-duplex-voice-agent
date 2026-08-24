@@ -1,6 +1,9 @@
 import unittest
 
-from src.adapters.llm.providers.qwen_transformers import TransformersQwenProvider
+from src.adapters.llm.providers.qwen_transformers import (
+    TransformersQwenProvider,
+    _TransformersRuntime,
+)
 from src.llm_runtime.stream import TokenChunk
 from src.model_runtime.factory import create_llm_adapter
 
@@ -59,6 +62,18 @@ class TransformersQwenProviderTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsInstance(adapter.provider, TransformersQwenProvider)
+
+    def test_transformers_runtime_flattens_model_options(self):
+        runtime = _TransformersRuntime(
+            None,
+            None,
+            model_options={"max_new_tokens": 64},
+            temperature=0.0,
+        )
+
+        self.assertEqual(runtime.generation_options["max_new_tokens"], 64)
+        self.assertEqual(runtime.generation_options["temperature"], 0.0)
+        self.assertNotIn("model_options", runtime.generation_options)
 
 
 if __name__ == "__main__":
