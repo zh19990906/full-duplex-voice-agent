@@ -20,12 +20,13 @@ async def main(model_path: str, prompt: str) -> None:
     started = time.perf_counter()
     provider = TransformersQwenProvider(model_path, device="cuda")
     loaded = time.perf_counter()
+    print(f"model_loaded_seconds={loaded - started:.3f}", flush=True)
+    print("generating...", flush=True)
     chunks = []
     async for chunk in provider.stream_tokens(prompt):
         chunks.append(chunk.text)
         print(chunk.text, end="", flush=True)
     print()
-    print(f"model_load_seconds={loaded - started:.3f}")
     print(f"token_chunks={len(chunks)}")
 
 

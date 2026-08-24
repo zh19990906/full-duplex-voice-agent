@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import queue
 import time
 from collections.abc import AsyncIterable, Mapping
 from typing import Any
@@ -192,6 +193,7 @@ class _TransformersRuntime:
             self.tokenizer,
             skip_prompt=True,
             skip_special_tokens=True,
+            timeout=1.0,
         )
         generation = dict(self.generation_options)
         generation.update(options)
@@ -211,7 +213,13 @@ class _TransformersRuntime:
             while True:
                 if self._cancelled:
                     return
-                item = await asyncio.to_thread(_next_or_none, streamer)
+                item = await asyncio.to_thread(_next_or_timeout, streamer)
+                if item is _STREAM_TIMEOUT:
+                    if generation_task.done() and not generation_task.cancelled():
+                        error = generation_task.exception()
+                        if error is not None:
+                            raise error
+                    continue
                 if item is None:
                     break
                 yield TokenChunk(f"qwen-{index}", item, time.time(), False)
@@ -233,8 +241,13 @@ class _TransformersRuntime:
         self._cancelled = False
 
 
-def _next_or_none(iterator: Any) -> Any:
+_STREAM_TIMEOUT = object()
+
+
+def _next_or_timeout(iterator: Any) -> Any:
     try:
         return next(iterator)
     except StopIteration:
         return None
+    except (queue.Empty, TimeoutError):
+        return _STREAM_TIMEOUT
