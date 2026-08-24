@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Full Duplex Voice Agent</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Research Console</p>
+        <h1>Full Duplex Voice Agent</h1>
+      </div>
+      <div class="session-controls">
+        <span>Session: <code id="session-id">none</code></span>
+        <span id="session-status" class="status">idle</span>
+        <button id="create-session" class="primary">Create</button>
+        <button id="close-session">Close</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="card conversation">
+        <div class="section-heading"><h2>Conversation</h2><span id="mic-status">microphone off</span></div>
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <form id="message-form" class="message-form">
+          <input id="message" autocomplete="off" placeholder="Type a message...">
+          <button class="primary" type="submit">Send</button>
+        </form>
+        <div class="voice-controls">
+          <button id="start-mic">Start microphone</button>
+          <button id="stop-mic">Stop microphone</button>
+        </div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="card">
+          <div class="section-heading"><h2>Agent State</h2></div>
+          <pre id="agent-state">Waiting for events...</pre>
+        </section>
+        <section class="card">
+          <div class="section-heading"><h2>Tools</h2></div>
+          <pre id="tool-output">No tool activity.</pre>
+        </section>
+        <section class="card experiment-panel">
+          <div class="section-heading"><h2>Experiment</h2></div>
+          <dl>
+            <dt>Variant</dt><dd>baseline</dd>
+            <dt>Model</dt><dd>llama_cpp</dd>
+            <dt>Prompt</dt><dd>v1</dd>
+            <dt>Memory</dt><dd>recent_20</dd>
+          </dl>
+        </section>
+      </aside>
+
+      <section class="card timeline-panel">
+        <div class="section-heading"><h2>Event Timeline</h2><span>live</span></div>
+        <ol id="timeline" class="timeline"></ol>
+      </section>
+    </main>
+    <script type="module" src="src/app.js"></script>
+  </body>
+</html>
