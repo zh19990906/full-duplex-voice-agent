@@ -1,0 +1,26 @@
+experiments:
+  conversation_test:
+    name: Conversation Test
+    description: Basic conversation response
+    profile: dev
+    scenario:
+      type: conversation
+      input: hello
+    metrics: latency,agent
+
+  interrupt_test:
+    name: Interrupt Test
+    description: Interruption and cancellation behavior
+    profile: hardware_benchmark
+    scenario:
+      type: interruption
+    metrics: latency,cancellation
+
+  tool_use_test:
+    name: Tool Use Test
+    description: Native calculator tool execution
+    profile: dev
+    scenario:
+      type: tool_use
+      input: calculate 2+2
+    metrics: latency,agent
