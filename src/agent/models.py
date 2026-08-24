@@ -55,9 +55,15 @@ class ToolCallRequest:
         if not self.call_id:
             object.__setattr__(self, "call_id", uuid4().hex)
 
+    @property
+    def tool_name(self) -> str:
+        """Stable semantic alias for the legacy ``name`` field."""
+
+        return self.name
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ToolCallRequest":
-        name = value.get("tool", value.get("name"))
+        name = value.get("tool", value.get("tool_name", value.get("name")))
         arguments = value.get("arguments", {})
         call_id = value.get("call_id", value.get("id", ""))
         if not isinstance(name, str) or not name:
@@ -67,4 +73,9 @@ class ToolCallRequest:
         return cls(name=name, arguments=dict(arguments), call_id=str(call_id))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"call_id": self.call_id, "tool": self.name, "arguments": dict(self.arguments)}
+        return {
+            "call_id": self.call_id,
+            "tool": self.name,
+            "tool_name": self.name,
+            "arguments": dict(self.arguments),
+        }

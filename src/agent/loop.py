@@ -12,6 +12,7 @@ from src.memory.context import ContextBuilder
 from src.memory.manager import MemoryManager
 from src.memory.models import ConversationMessage
 from src.tools.models import ToolResult
+from src.tools.parser import ToolCallParser
 from src.tools.router import ToolRouter
 
 from .models import AgentState, AgentStatus, ToolCallRequest
@@ -38,6 +39,7 @@ class AgentLoop:
         context_builder: ContextBuilder | None = None,
         max_iterations: int = 5,
         tool_timeout: float | None = None,
+        tool_parser: ToolCallParser | None = None,
     ) -> None:
         if not callable(decision_provider):
             raise TypeError("decision_provider must be callable")
@@ -52,6 +54,7 @@ class AgentLoop:
         self.context_builder = context_builder or ContextBuilder(memory_manager)
         self.max_iterations = max_iterations
         self.tool_timeout = tool_timeout
+        self.tool_parser = tool_parser or ToolCallParser()
         self.state = AgentState(session_id=session_id)
         self.state_history: list[AgentStatus] = [AgentStatus.IDLE]
 
@@ -116,13 +119,10 @@ class AgentLoop:
                 tool_name=request.name,
             )
 
-    @staticmethod
-    def _normalize_tool_call(decision: AgentDecision) -> ToolCallRequest | None:
+    def _normalize_tool_call(self, decision: AgentDecision) -> ToolCallRequest | None:
         if isinstance(decision, ToolCallRequest):
             return decision
-        if isinstance(decision, Mapping) and ("tool" in decision or "name" in decision):
-            return ToolCallRequest.from_mapping(decision)
-        return None
+        return self.tool_parser.parse(decision)
 
     @staticmethod
     def _normalize_final_response(decision: AgentDecision) -> str:
