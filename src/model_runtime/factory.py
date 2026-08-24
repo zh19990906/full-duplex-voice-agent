@@ -15,6 +15,7 @@ from src.adapters.asr.backend import StreamingASRBackend
 from src.adapters.asr.providers.whisper import WhisperASRProvider
 from src.adapters.llm.backend import StreamingLLMBackend
 from src.adapters.llm.providers.llama_cpp import LlamaCppLLMProvider
+from src.adapters.llm.providers.qwen_transformers import TransformersQwenProvider
 from src.adapters.tts.backend import StreamingTTSBackend
 from src.adapters.tts.providers.cosyvoice import CosyVoiceTTSProvider
 
@@ -65,6 +66,15 @@ class ProviderFactory:
             provider_instance = LlamaCppLLMProvider(
                 profile.model_path,
                 device=profile.device or "cpu",
+                options=profile.options,
+                runtime=provider_instance,
+            )
+        if profile.provider == "transformers" and not isinstance(
+            provider_instance, TransformersQwenProvider
+        ):
+            provider_instance = TransformersQwenProvider(
+                profile.model_path,
+                device=profile.device or "cuda",
                 options=profile.options,
                 runtime=provider_instance,
             )
@@ -142,7 +152,7 @@ def _profile(config: Any, provider: Any | None) -> "_FactoryProfile":
     if model_path is None:
         raise ValueError("model profile must define model_path or local_path")
     provider_instance = provider if provider is not None else configured_provider
-    if provider_instance is None:
+    if provider_instance is None and provider_name != "transformers":
         raise ValueError(
             f"provider instance is required for {provider_name!r}; model loading is outside the factory"
         )
