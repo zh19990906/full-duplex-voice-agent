@@ -4,6 +4,7 @@ import unittest
 from benchmarks.metrics import calculate_metrics
 from benchmarks.timeline import BenchmarkTimeline
 from src.adapters.tts.providers.cosyvoice import CosyVoiceTTSProvider
+from src.adapters.tts.providers.cosyvoice_worker import CosyVoiceWorkerClient
 from src.model_runtime.factory import create_tts_adapter
 from src.tts_runtime.stream import AudioChunk
 
@@ -53,6 +54,23 @@ class TTSProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsInstance(adapter.provider, CosyVoiceTTSProvider)
         self.assertEqual(adapter.model_path, "models/tts")
+
+    async def test_factory_builds_isolated_cosyvoice_worker_from_config(self):
+        adapter = create_tts_adapter(
+            {
+                "provider": "cosyvoice_worker",
+                "model_path": "/mnt/models/cosyvoice",
+                "options": {
+                    "worker_python": "/home/CosyVoice/.venv/bin/python",
+                    "prompt_audio": "/tmp/prompt.wav",
+                    "prompt_text": "reference",
+                },
+            }
+        )
+
+        self.assertIsInstance(adapter.provider, CosyVoiceTTSProvider)
+        self.assertIsInstance(adapter.provider.runtime, CosyVoiceWorkerClient)
+        self.assertEqual(adapter.provider.runtime.prompt_audio, "/tmp/prompt.wav")
 
     async def test_partial_and_final_audio_chunks(self):
         runtime = FakeCosyVoiceRuntime()

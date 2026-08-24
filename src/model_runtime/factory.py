@@ -18,6 +18,7 @@ from src.adapters.llm.providers.llama_cpp import LlamaCppLLMProvider
 from src.adapters.llm.providers.qwen_transformers import TransformersQwenProvider
 from src.adapters.tts.backend import StreamingTTSBackend
 from src.adapters.tts.providers.cosyvoice import CosyVoiceTTSProvider
+from src.adapters.tts.providers.cosyvoice_worker import CosyVoiceWorkerClient
 
 from .lifecycle import ModelLifecycleManager
 from .resolver import ModelProfile
@@ -88,10 +89,31 @@ class ProviderFactory:
         lifecycle_manager: ModelLifecycleManager | None = None,
     ) -> StreamingTTSBackend:
         profile = _profile(config, provider)
-        if profile.provider not in {"cosyvoice", "fake", "local", "huggingface", "modelscope", "xtts", "vits"}:
+        if profile.provider not in {
+            "cosyvoice",
+            "cosyvoice_worker",
+            "fake",
+            "local",
+            "huggingface",
+            "modelscope",
+            "xtts",
+            "vits",
+        }:
             raise ValueError(f"unsupported TTS provider: {profile.provider}")
         provider_instance = profile.provider_instance
         if profile.provider == "cosyvoice" and not isinstance(provider_instance, CosyVoiceTTSProvider):
+            provider_instance = CosyVoiceTTSProvider(
+                profile.model_path,
+                device=profile.device or "cpu",
+                options=profile.options,
+                runtime=provider_instance,
+            )
+        if profile.provider == "cosyvoice_worker" and provider_instance is None:
+            provider_instance = CosyVoiceWorkerClient(
+                profile.model_path,
+                **dict(profile.options or {}),
+            )
+        if profile.provider == "cosyvoice_worker" and not isinstance(provider_instance, CosyVoiceTTSProvider):
             provider_instance = CosyVoiceTTSProvider(
                 profile.model_path,
                 device=profile.device or "cpu",
@@ -152,7 +174,7 @@ def _profile(config: Any, provider: Any | None) -> "_FactoryProfile":
     if model_path is None:
         raise ValueError("model profile must define model_path or local_path")
     provider_instance = provider if provider is not None else configured_provider
-    if provider_instance is None and provider_name != "transformers":
+    if provider_instance is None and provider_name not in {"transformers", "cosyvoice_worker"}:
         raise ValueError(
             f"provider instance is required for {provider_name!r}; model loading is outside the factory"
         )
