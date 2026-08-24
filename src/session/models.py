@@ -38,6 +38,7 @@ class Session:
     status: SessionStatus = SessionStatus.CREATED
     metadata: dict[str, Any] = field(default_factory=dict)
     resources: dict[str, SessionResource] = field(default_factory=dict, repr=False)
+    agent_state: dict[str, Any] = field(default_factory=dict, repr=False)
     memory_manager: Any = field(default=None, repr=False, compare=False)
     agent: Any = field(default=None, repr=False, compare=False)
 
@@ -47,6 +48,7 @@ class Session:
         self.created_at = float(self.created_at)
         self.metadata = dict(self.metadata)
         self.resources = dict(self.resources)
+        self.agent_state = dict(self.agent_state)
 
     def activate(self) -> None:
         if self.status not in {SessionStatus.CREATED, SessionStatus.IDLE}:
@@ -87,4 +89,5 @@ class Session:
             "status": self.status.value,
             "metadata": dict(self.metadata),
             "resources": {name: resource.to_dict() for name, resource in self.resources.items()},
+            "agent_state": dict(self.agent_state),
         }

@@ -1,3 +1,6 @@
 session:
   max_sessions: 100
   idle_timeout_seconds: 1800
+  storage:
+    provider: sqlite
+    path: ./data/sessions.db

@@ -4,6 +4,7 @@ from .agent import SessionAgent
 from .manager import SessionManager
 from .models import Session, SessionResource, SessionStatus
 from .registry import SessionRegistry
+from .storage import SQLiteSessionStore, SessionStore
 
 __all__ = [
     "Session",
@@ -12,4 +13,6 @@ __all__ = [
     "SessionRegistry",
     "SessionResource",
     "SessionStatus",
+    "SessionStore",
+    "SQLiteSessionStore",
 ]
