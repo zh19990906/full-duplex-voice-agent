@@ -1,7 +1,5 @@
 """Serve the real text-to-speech path and bundled frontend on port 8001."""
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json
