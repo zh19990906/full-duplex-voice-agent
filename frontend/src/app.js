@@ -35,11 +35,14 @@ export class StreamingAssistantMessage {
   }
 }
 
-export function bootResearchConsole(documentRef = document) {
+export function bootResearchConsole(
+  documentRef = document,
+  { microphoneFactory = (options) => new PcmMicrophoneInput(options) } = {},
+) {
   const api = createApiClient(appConfig);
   const timeline = new EventTimeline(byId("timeline"));
   const audioOutput = new BrowserAudioOutput();
-  const state = { sessionId: null, socket: null, microphone: null };
+  const state = { sessionId: null, socket: null, microphone: null, microphoneStart: Promise.resolve() };
 
   const setStatus = (text) => { byId("session-status").textContent = text; };
   const appendChat = (role, text) => {
@@ -103,11 +106,17 @@ export function bootResearchConsole(documentRef = document) {
 
   byId("start-mic").addEventListener("click", async () => {
     if (!state.socket) return setStatus("请先创建会话");
-    state.microphone = new PcmMicrophoneInput({
-      onChunk: (buffer) => state.socket.sendAudio(buffer),
-      onStateChange: (value) => { byId("mic-status").textContent = value; },
-    });
-    await state.microphone.start();
+    const startMicrophone = async () => {
+      await state.microphone?.stop();
+      const microphone = microphoneFactory({
+        onChunk: (buffer) => state.socket.sendAudio(buffer),
+        onStateChange: (value) => { byId("mic-status").textContent = value; },
+      });
+      state.microphone = microphone;
+      await microphone.start();
+    };
+    state.microphoneStart = state.microphoneStart.then(startMicrophone, startMicrophone);
+    await state.microphoneStart;
   });
   byId("stop-mic").addEventListener("click", () => state.microphone?.stop());
 

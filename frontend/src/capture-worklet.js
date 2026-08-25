@@ -37,15 +37,14 @@ export class PcmFrameEncoder {
 
   #encodeFrame() {
     const frame = new ArrayBuffer(HEADER_BYTES + (this.frameSamples * Int16Array.BYTES_PER_ELEMENT));
-    const header = new DataView(frame, 0, HEADER_BYTES);
+    const header = new DataView(frame);
     header.setUint8(0, PROTOCOL_VERSION);
     header.setUint32(1, this.sequence, false);
     header.setFloat64(5, this.frameTimestamp, false);
     header.setUint32(13, this.sampleRate, false);
     header.setUint8(17, MONO_CHANNELS);
-    const pcm = new Int16Array(frame, HEADER_BYTES, this.frameSamples);
     for (let index = 0; index < this.frameSamples; index += 1) {
-      pcm[index] = clampPcm16(this.pendingSamples[index]);
+      header.setInt16(HEADER_BYTES + (index * Int16Array.BYTES_PER_ELEMENT), clampPcm16(this.pendingSamples[index]), true);
     }
     this.pendingSamples = [];
     this.frameTimestamp = null;

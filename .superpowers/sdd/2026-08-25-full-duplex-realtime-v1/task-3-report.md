@@ -56,3 +56,48 @@ Reviewed every changed/new file against the V1 contract. The header is exactly 1
 ## Concerns
 
 Automated tests use narrow browser fakes and Node cannot exercise a physical microphone or a browser's actual AudioWorklet scheduler. A manual modern-browser microphone check remains advisable before release; this does not affect the verified wire contract or lifecycle behavior.
+
+## Fix Round 1
+
+### Delivered
+
+- Serialized Start-click replacement in `app.js`; an active microphone is stopped before the factory creates and starts its replacement.
+- Resumed suspended capture contexts before connecting the microphone worklet.
+- Made start-failure cleanup release locally allocated source/worklet/port as well as stream/context, and made release operations idempotent so one cleanup failure does not prevent the rest.
+- Changed PCM payload serialization to explicit `DataView.setInt16(offset, sample, true)` writes and added literal byte assertions.
+
+### TDD evidence
+
+RED against `dc99fc6`:
+
+```text
+$ node --test tests/frontend_audio_capture_test.mjs
+tests 8; pass 5; fail 3
+- suspended context: expected ["resumed"], actual []
+- setup failure cleanup: expected port/worklet/source cleanup, actual only track/context cleanup
+- second Start click: attempted navigator.mediaDevices.getUserMedia instead of replacing through the microphone factory
+```
+
+The literal-byte test passed on the host before this fix because its native typed-array endianness is little-endian; the production implementation now explicitly writes the required byte order independently of that host property.
+
+The failure-cleanup test was then strengthened to throw from `onStateChange("录音中")` after ownership assignment. Its RED showed all four instance fields still held the stream/context/source/worklet after local cleanup; GREEN clears all four fields before releasing those same resources.
+
+GREEN:
+
+```text
+$ node --test tests/frontend_audio_capture_test.mjs
+tests 8; pass 8; fail 0
+
+$ python3 -m unittest tests.test_frontend_audio_capture tests.test_web_ui tests.test_frontend_streaming -v
+Ran 10 tests ... OK
+
+$ python3 -m unittest discover -s tests
+Ran 282 tests ... OK
+
+$ git diff --check
+exit 0; no output
+```
+
+### Fix Round 1 self-review and concerns
+
+Verified that only capture/app lifecycle and PCM byte serialization changed; `BrowserAudioOutput` remains untouched. The deferred transfer-list test wording/coverage was not broadened. No subagents or external reviewers were used. The existing physical-browser AudioWorklet smoke-test concern remains.

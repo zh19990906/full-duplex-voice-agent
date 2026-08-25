@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+globalThis.window ||= {
+  location: {
+    protocol: "http:",
+    host: "localhost:8001",
+    origin: "http://localhost:8001",
+  },
+};
+
 const { PcmFrameEncoder, StreamingResampler } = await import("../frontend/src/capture-worklet.js");
 const { PcmMicrophoneInput } = await import("../frontend/src/audio.js");
+const { bootResearchConsole } = await import("../frontend/src/app.js");
 
 const PCM_HEADER_BYTES = 18;
 
@@ -12,6 +21,15 @@ const makeLiteralFrame = () => {
   samples[1] = 1;
   samples[2] = -1;
   return samples;
+};
+
+const replaceGlobal = (name, value) => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, name);
+  Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+  return () => {
+    if (previous) Object.defineProperty(globalThis, name, previous);
+    else delete globalThis[name];
+  };
 };
 
 test("encoder holds partial samples and emits a complete V1 PCM16 frame", () => {
@@ -41,6 +59,12 @@ test("encoder holds partial samples and emits a complete V1 PCM16 frame", () => 
   assert.equal(secondPcm[0], 0);
   assert.equal(secondPcm[1], 32767);
   assert.equal(secondPcm[2], -32768);
+});
+
+test("encoder writes PCM16 payload bytes in little-endian order", () => {
+  const [binary] = new PcmFrameEncoder().push(makeLiteralFrame(), 1);
+
+  assert.deepEqual([...new Uint8Array(binary, PCM_HEADER_BYTES, 6)], [0x00, 0x00, 0xff, 0x7f, 0x00, 0x80]);
 });
 
 test("resampler retains source-rate phase across worklet process boundaries", () => {
@@ -155,5 +179,137 @@ test("PcmMicrophoneInput sends transferred binary buffers and stops every owned 
     Object.defineProperty(globalThis, "navigator", previousNavigator);
     globalThis.AudioContext = previousAudioContext;
     globalThis.AudioWorkletNode = previousAudioWorkletNode;
+  }
+});
+
+test("PcmMicrophoneInput resumes a suspended context before capture", async () => {
+  const events = [];
+  const stream = { getTracks: () => [{ stop: () => events.push("track-stopped") }] };
+  class SuspendedContext {
+    constructor() {
+      this.state = "suspended";
+      this.destination = {};
+      this.audioWorklet = { addModule: async () => {} };
+    }
+
+    async resume() {
+      events.push("resumed");
+      this.state = "running";
+    }
+
+    createMediaStreamSource() {
+      return { connect: () => {}, disconnect: () => events.push("source-disconnected") };
+    }
+
+    close() { events.push("context-closed"); }
+  }
+  class WorkletNode {
+    constructor() {
+      this.port = { close: () => events.push("port-closed") };
+    }
+
+    connect() {}
+    disconnect() { events.push("worklet-disconnected"); }
+  }
+  const restoreNavigator = replaceGlobal("navigator", { mediaDevices: { getUserMedia: async () => stream } });
+  const restoreContext = replaceGlobal("AudioContext", SuspendedContext);
+  const restoreWorklet = replaceGlobal("AudioWorkletNode", WorkletNode);
+
+  try {
+    const input = new PcmMicrophoneInput();
+    await input.start();
+    assert.deepEqual(events, ["resumed"]);
+    await input.stop();
+  } finally {
+    restoreNavigator();
+    restoreContext();
+    restoreWorklet();
+  }
+});
+
+test("PcmMicrophoneInput clears every owned resource when recording-state notification fails", async () => {
+  const events = [];
+  const stream = { getTracks: () => [{ stop: () => events.push("track-stopped") }] };
+  class Context {
+    constructor() {
+      this.state = "running";
+      this.destination = {};
+      this.audioWorklet = { addModule: async () => {} };
+    }
+
+    createMediaStreamSource() {
+      return {
+        connect: () => {},
+        disconnect: () => events.push("source-disconnected"),
+      };
+    }
+
+    close() { events.push("context-closed"); }
+  }
+  class WorkletNode {
+    constructor() {
+      this.port = { close: () => events.push("port-closed") };
+    }
+
+    connect() {}
+    disconnect() { events.push("worklet-disconnected"); }
+  }
+  const restoreNavigator = replaceGlobal("navigator", { mediaDevices: { getUserMedia: async () => stream } });
+  const restoreContext = replaceGlobal("AudioContext", Context);
+  const restoreWorklet = replaceGlobal("AudioWorkletNode", WorkletNode);
+
+  try {
+    const input = new PcmMicrophoneInput({
+      onStateChange: () => { throw new Error("recording state failed"); },
+    });
+    await assert.rejects(input.start(), /recording state failed/);
+    assert.deepEqual(events, ["port-closed", "worklet-disconnected", "source-disconnected", "track-stopped", "context-closed"]);
+    assert.deepEqual([input.stream, input.context, input.source, input.worklet], [null, null, null, null]);
+    await input.stop();
+    assert.deepEqual(events, ["port-closed", "worklet-disconnected", "source-disconnected", "track-stopped", "context-closed"]);
+  } finally {
+    restoreNavigator();
+    restoreContext();
+    restoreWorklet();
+  }
+});
+
+test("a second Start click stops the active microphone before replacement", async () => {
+  const elements = new Map();
+  const element = () => ({
+    textContent: "",
+    value: "",
+    append: () => {},
+    prepend: () => {},
+    addEventListener(type, listener) { this.listeners ||= new Map(); this.listeners.set(type, listener); },
+    async trigger(type) { await this.listeners.get(type)({ preventDefault: () => {} }); },
+  });
+  for (const id of ["timeline", "session-status", "messages", "agent-state", "tool-output", "session-id", "create-session", "close-session", "message-form", "message", "start-mic", "stop-mic", "mic-status"]) {
+    elements.set(id, element());
+  }
+  const documentRef = {
+    getElementById: (id) => elements.get(id),
+    createElement: () => element(),
+  };
+  const restoreDocument = replaceGlobal("document", documentRef);
+  const lifecycle = [];
+  const microphones = ["first", "second"].map((name) => ({
+    start: async () => lifecycle.push(`${name}-start`),
+    stop: async () => lifecycle.push(`${name}-stop`),
+  }));
+  const [, second] = microphones;
+
+  try {
+    const { state } = bootResearchConsole(documentRef, {
+      microphoneFactory: () => microphones.shift(),
+    });
+    state.socket = { sendAudio: () => {} };
+    await elements.get("start-mic").trigger("click");
+    await elements.get("start-mic").trigger("click");
+
+    assert.deepEqual(lifecycle, ["first-start", "first-stop", "second-start"]);
+    assert.equal(state.microphone, second);
+  } finally {
+    restoreDocument();
   }
 });

@@ -21,21 +21,27 @@ export class PcmMicrophoneInput {
   }
 
   async #start() {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-    if (this.cancelStart) return this.#release({ stream });
-    const context = new AudioContext();
+    let stream = null;
+    let context = null;
+    let source = null;
+    let worklet = null;
     try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      if (this.cancelStart) return this.#release({ stream });
+      context = new AudioContext();
       await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url));
       if (this.cancelStart) return this.#release({ stream, context });
-      const source = context.createMediaStreamSource(stream);
-      const worklet = new AudioWorkletNode(context, "pcm-capture-processor");
+      if (context.state === "suspended") await context.resume();
+      if (this.cancelStart) return this.#release({ stream, context });
+      source = context.createMediaStreamSource(stream);
+      worklet = new AudioWorkletNode(context, "pcm-capture-processor");
       worklet.port.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) this.onChunk?.(event.data);
       };
@@ -48,7 +54,9 @@ export class PcmMicrophoneInput {
       this.worklet = worklet;
       this.onStateChange("录音中");
     } catch (error) {
-      await this.#release({ stream, context });
+      const ownsResources = this.stream === stream || this.context === context
+        || this.source === source || this.worklet === worklet;
+      await this.#release(ownsResources ? this : { stream, context, source, worklet });
       throw error;
     }
   }
@@ -68,20 +76,27 @@ export class PcmMicrophoneInput {
   async #release(resources = this) {
     const { stream, context, source, worklet } = resources;
     const hasResources = Boolean(stream || context || source || worklet);
-    if (worklet) {
-      worklet.port.onmessage = null;
-      worklet.port.close?.();
-      worklet.disconnect?.();
-    }
-    source?.disconnect?.();
-    stream?.getTracks().forEach((track) => track.stop());
-    await context?.close?.();
     if (resources === this) {
       this.stream = null;
       this.context = null;
       this.source = null;
       this.worklet = null;
     }
+    const safely = async (operation) => {
+      try {
+        await operation();
+      } catch {
+        // Continue releasing the remaining browser resources.
+      }
+    };
+    if (worklet) {
+      worklet.port.onmessage = null;
+      await safely(() => worklet.port.close?.());
+      await safely(() => worklet.disconnect?.());
+    }
+    await safely(() => source?.disconnect?.());
+    for (const track of stream?.getTracks() || []) await safely(() => track.stop());
+    await safely(() => context?.close?.());
     return hasResources;
   }
 }
