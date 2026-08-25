@@ -52,6 +52,20 @@ cosyvoice_worker` and options for `worker_python`, `prompt_audio`, and
 `prompt_text`; the worker script itself must be launched with the CosyVoice
 virtual environment.
 
+Run the complete offline backend chain without starting the browser frontend:
+
+```bash
+python scripts/test_real_stack.py \
+  --asr-model /mnt/model-zhangheng/X2-Turn-4B-0812 \
+  --llm-model /mnt/model-zhangheng/Qwen2.5-14B-Instruct \
+  --tts-model /mnt/model-zhangheng/Fun-CosyVoice3-0.5B-2512 \
+  --audio /home/X2-Turn/turn-demo/assets/sample_en.wav \
+  --x2-root /home/X2-Turn/voxtral-realtime \
+  --prompt-audio /home/X2-Turn/turn-demo/assets/sample_en.wav \
+  --prompt-text 'hello can you tell me what the weather is like today<|endofprompt|>' \
+  --output /tmp/real_stack_response.wav
+```
+
 ## High Level Architecture
 
 ```
