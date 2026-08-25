@@ -12,9 +12,9 @@ Every V1 domain or transport event is a `RealtimeEnvelope` with
 `protocol_version` set to `1`. Its stable fields are `event`, `event_id`,
 `session_id`, `sequence`, `capture_timestamp`, `server_timestamp`,
 `response_id`, `generation_epoch`, `segment_id`, and `payload`. `response_id`
-and `segment_id` may be `null` before a response or segmented output exists.
-Consumers must reject another protocol version rather than guessing its
-meaning.
+may be `null` before a response exists; `segment_id` is a nullable integer
+used by segmented output cursors. Consumers must reject another protocol
+version rather than guessing its meaning.
 
 `session_id`, `response_id`, `generation_epoch`, `segment_id`, `sequence`,
 and capture and server timestamps make ordering, cancellation, and

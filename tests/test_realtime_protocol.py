@@ -20,7 +20,7 @@ class RealtimeProtocolTests(unittest.TestCase):
             server_timestamp=10.1,
             response_id="response-2",
             generation_epoch=3,
-            segment_id="segment-5",
+            segment_id=5,
             payload={"confidence": 0.9},
         )
 
@@ -28,7 +28,42 @@ class RealtimeProtocolTests(unittest.TestCase):
         self.assertEqual(envelope.to_dict()["generation_epoch"], 3)
         self.assertEqual(envelope.to_dict()["session_id"], "session-1")
         self.assertEqual(envelope.to_dict()["sequence"], 4)
-        self.assertEqual(envelope.to_dict()["segment_id"], "segment-5")
+        self.assertEqual(envelope.to_dict()["segment_id"], 5)
+
+    def test_existing_positional_protocol_version_slot_remains_unchanged(self):
+        positional_arguments = (
+            "BACKCHANNEL_CONFIRMED",
+            "evt-1",
+            "session-1",
+            4,
+            10.0,
+            10.1,
+            "response-2",
+            3,
+            {"confidence": 0.9},
+        )
+
+        envelope = RealtimeEnvelope(*positional_arguments, 1)
+
+        self.assertEqual(envelope.protocol_version, 1)
+        self.assertIsNone(envelope.segment_id)
+        with self.assertRaises(ValueError):
+            RealtimeEnvelope(*positional_arguments, 2)
+
+    def test_envelope_rejects_non_integer_segment_id(self):
+        with self.assertRaises(ValueError):
+            RealtimeEnvelope(
+                event="BACKCHANNEL_CONFIRMED",
+                event_id="evt-1",
+                session_id="session-1",
+                sequence=4,
+                capture_timestamp=10.0,
+                server_timestamp=10.1,
+                response_id="response-2",
+                generation_epoch=3,
+                payload={"confidence": 0.9},
+                segment_id="segment-5",
+            )
 
     def test_audio_frame_round_trip_preserves_pcm_and_header(self):
         header = AudioFrameHeader(

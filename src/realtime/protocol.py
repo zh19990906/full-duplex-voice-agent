@@ -29,12 +29,14 @@ class RealtimeEnvelope:
     response_id: str | None
     generation_epoch: int
     payload: dict[str, Any]
-    segment_id: str | None = None
     protocol_version: int = PROTOCOL_VERSION
+    segment_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.protocol_version != PROTOCOL_VERSION:
             raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        if self.segment_id is not None and type(self.segment_id) is not int:
+            raise ValueError("segment_id must be an integer or None")
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable V1 transport representation."""
