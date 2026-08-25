@@ -8,6 +8,7 @@ from .protocol import (
 )
 from .cancellation import ActiveTaskSlot, CancellationToken
 from .identifiers import GenerationClock, IdentifierAllocator
+from .response_pipeline import RealtimeResponsePipeline, ResponsePipelineResult
 from .session_state import (
     ConversationMode,
     FloorState,
@@ -15,6 +16,7 @@ from .session_state import (
     ResponseState,
     SessionState,
 )
+from .text_segmenter import LanguageAwareTextSegmenter, TextSegment
 
 __all__ = [
     "AudioFrameHeader",
@@ -24,10 +26,14 @@ __all__ = [
     "FloorState",
     "GenerationClock",
     "IdentifierAllocator",
+    "LanguageAwareTextSegmenter",
+    "RealtimeResponsePipeline",
     "RealtimeEnvelope",
     "ResponseRecord",
+    "ResponsePipelineResult",
     "ResponseState",
     "SessionState",
+    "TextSegment",
     "decode_audio_frame",
     "encode_audio_frame",
 ]

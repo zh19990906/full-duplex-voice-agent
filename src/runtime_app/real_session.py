@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from src.llm_runtime.stream import TokenChunk
+from src.realtime.cancellation import CancellationToken
+from src.realtime.identifiers import GenerationClock, IdentifierAllocator
+from src.realtime.response_pipeline import RealtimeResponsePipeline
+from src.realtime.text_segmenter import LanguageAwareTextSegmenter, TextSegment
 
 
 Publish = Callable[[Any], Awaitable[None] | None]
+_QUEUE_STOP = object()
 
 
 class RealModelSession:
@@ -22,44 +28,152 @@ class RealModelSession:
         publish: Publish,
         *,
         prompt_builder: Callable[[str], str] | None = None,
+        segmenter: LanguageAwareTextSegmenter | None = None,
+        tts_queue_capacity: int = 2,
     ) -> None:
+        if segmenter is not None and not isinstance(segmenter, LanguageAwareTextSegmenter):
+            raise TypeError("segmenter must be a LanguageAwareTextSegmenter")
+        if isinstance(tts_queue_capacity, bool) or not isinstance(tts_queue_capacity, int):
+            raise TypeError("tts_queue_capacity must be an integer")
+        if tts_queue_capacity <= 0:
+            raise ValueError("tts_queue_capacity must be positive")
         self.llm = llm
         self.tts = tts
         self.publish = publish
         self.prompt_builder = prompt_builder or (lambda text: text)
+        self.generation_clock = GenerationClock()
+        self._identifiers = IdentifierAllocator()
+        self._segmenter = segmenter or LanguageAwareTextSegmenter()
+        self._tts_queue_capacity = tts_queue_capacity
+        self._run_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
+        self._active_token: CancellationToken | None = None
+        self._active_epoch: int | None = None
+        self._active_invalidated = False
         self._interrupted = False
 
     async def run(self, text: str) -> str:
         """Stream one LLM response followed by its TTS audio."""
 
-        self._interrupted = False
-        pieces: list[str] = []
-        async for token in self.llm.stream_tokens(self.prompt_builder(text)):
-            if self._interrupted:
-                return "".join(pieces)
-            pieces.append(token.text if isinstance(token, TokenChunk) else str(token))
-            await self._emit(token)
-
-        response = "".join(pieces).strip()
-        if not response or self._interrupted:
-            return response
-        audio = await self.tts.stream_audio(response)
-        async for chunk in audio:
-            if self._interrupted:
-                return response
-            await self._emit(chunk)
-        return response
+        async with self._run_lock:
+            await self._reset_provider(self.llm)
+            await self._reset_provider(self.tts)
+            epoch, token = await self._begin_run()
+            queue: asyncio.Queue[TextSegment | object] = asyncio.Queue(
+                maxsize=self._tts_queue_capacity
+            )
+            pipeline = RealtimeResponsePipeline(
+                llm=self.llm,
+                segment_queue=queue,
+                generation_clock=self.generation_clock,
+                segmenter=self._segmenter,
+                cancellation_token=token,
+                response_id_factory=self._identifiers.next_response_id,
+                on_token=self._emit,
+            )
+            consumer = asyncio.create_task(self._consume_segments(queue, epoch, token))
+            try:
+                result = await pipeline.run(self.prompt_builder(text))
+                if consumer.done():
+                    await consumer
+                await queue.put(_QUEUE_STOP)
+                await consumer
+                return result.text
+            except BaseException:
+                token.cancel()
+                await self._interrupt_provider(self.llm)
+                if not consumer.done():
+                    consumer.cancel()
+                try:
+                    await consumer
+                except asyncio.CancelledError:
+                    pass
+                raise
+            finally:
+                await self._finish_run(epoch, token)
 
     async def interrupt(self) -> None:
         """Cancel both generation stages and prevent stale audio publication."""
 
-        self._interrupted = True
+        async with self._state_lock:
+            self._interrupted = True
+            token = self._active_token
+            if token is not None:
+                token.cancel()
+            if self._active_epoch is not None and not self._active_invalidated:
+                self.generation_clock.advance()
+                self._active_invalidated = True
         for provider in (self.llm, self.tts):
-            method = getattr(provider, "interrupt", None) or getattr(provider, "cancel", None)
-            if callable(method):
-                result = method()
-                if inspect.isawaitable(result):
-                    await result
+            await self._interrupt_provider(provider)
+
+    async def _begin_run(self) -> tuple[int, CancellationToken]:
+        async with self._state_lock:
+            self._interrupted = False
+            epoch = self.generation_clock.advance()
+            token = CancellationToken()
+            self._active_token = token
+            self._active_epoch = epoch
+            self._active_invalidated = False
+            return epoch, token
+
+    async def _finish_run(self, epoch: int, token: CancellationToken) -> None:
+        async with self._state_lock:
+            if self._active_epoch == epoch and self._active_token is token:
+                self._active_token = None
+                self._active_epoch = None
+                self._active_invalidated = False
+
+    async def _consume_segments(
+        self,
+        queue: asyncio.Queue[TextSegment | object],
+        epoch: int,
+        cancellation_token: CancellationToken,
+    ) -> None:
+        try:
+            while True:
+                item = await queue.get()
+                try:
+                    if item is _QUEUE_STOP:
+                        return
+                    assert isinstance(item, TextSegment)
+                    if not self._is_current(epoch, cancellation_token):
+                        continue
+                    audio = self.tts.stream_audio(item.text)
+                    if inspect.isawaitable(audio):
+                        audio = await audio
+                    if not self._is_current(epoch, cancellation_token):
+                        continue
+                    async for chunk in audio:
+                        if not self._is_current(epoch, cancellation_token):
+                            break
+                        await self._emit(chunk)
+                        if not self._is_current(epoch, cancellation_token):
+                            break
+                finally:
+                    queue.task_done()
+        except BaseException:
+            cancellation_token.cancel()
+            await self._interrupt_provider(self.llm)
+            raise
+
+    def _is_current(self, epoch: int, token: CancellationToken) -> bool:
+        return self.generation_clock.is_current(epoch) and not token.is_cancelled()
+
+    @staticmethod
+    async def _interrupt_provider(provider: Any) -> None:
+        method = getattr(provider, "interrupt", None) or getattr(provider, "cancel", None)
+        if callable(method):
+            result = method()
+            if inspect.isawaitable(result):
+                await result
+
+    @staticmethod
+    async def _reset_provider(provider: Any) -> None:
+        method = getattr(provider, "reset", None)
+        if callable(method):
+            result = method()
+            if inspect.isawaitable(result):
+                await result
 
     async def _emit(self, value: Any) -> None:
         result = self.publish(value)

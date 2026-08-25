@@ -12,6 +12,8 @@ class TokenChunk:
     text: str
     timestamp: float
     is_final: bool
+    response_id: str | None = None
+    generation_epoch: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a deterministic dictionary representation."""
