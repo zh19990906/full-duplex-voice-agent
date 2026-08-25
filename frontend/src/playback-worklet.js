@@ -16,6 +16,7 @@ export class PlaybackRenderer {
   }
 
   enqueue(item) {
+    if (!Number.isFinite(item.sample_rate) || item.sample_rate <= 0) return false;
     if (item.generation_epoch < this.currentEpoch) return false;
     if (item.generation_epoch > this.currentEpoch) this.setEpoch(item.generation_epoch);
     this.pending.push({ ...item, pcm16: new Int16Array(item.pcm16), position: 0 });

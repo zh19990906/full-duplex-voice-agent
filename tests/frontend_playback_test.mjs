@@ -17,9 +17,24 @@ class FakePort {
   }
 
   emit(data) {
-    this.onmessage({ data });
+    this.onmessage?.({ data });
   }
 }
+
+const deferred = () => {
+  let resolve;
+  const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+};
+
+const replaceGlobal = (name, value) => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, name);
+  Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+  return () => {
+    if (previous) Object.defineProperty(globalThis, name, previous);
+    else delete globalThis[name];
+  };
+};
 
 class FakeAudioParam {
   constructor(value = 1) {
@@ -159,6 +174,159 @@ test("coordinator decodes base64 PCM16 and forwards the source sample rate to th
   assert.equal(message.type, "enqueue");
   assert.equal(message.item.sample_rate, 24000);
   assert.deepEqual([...new Int16Array(message.item.pcm16)], [0, 16384, -16384]);
+});
+
+test("concurrent unlock calls create one worklet and gain chain", async () => {
+  const moduleGate = deferred();
+  const contexts = [];
+  const nodes = [];
+  class Context {
+    constructor() {
+      this.state = "running";
+      this.destination = {};
+      this.gains = [];
+      this.audioWorklet = { addModule: () => { this.moduleCalls = (this.moduleCalls || 0) + 1; return moduleGate.promise; } };
+      contexts.push(this);
+    }
+    createGain() { const gain = { gain: new FakeAudioParam(), connect() {} }; this.gains.push(gain); return gain; }
+  }
+  class WorkletNode {
+    constructor() { this.port = new FakePort(); nodes.push(this); }
+    connect() {}
+  }
+  const restoreContext = replaceGlobal("AudioContext", Context);
+  const restoreWorklet = replaceGlobal("AudioWorkletNode", WorkletNode);
+
+  try {
+    const coordinator = new BrowserPlaybackCoordinator();
+    const first = coordinator.unlock();
+    const second = coordinator.unlock();
+    assert.equal(contexts.length, 1);
+    assert.equal(contexts[0].moduleCalls, 1);
+
+    moduleGate.resolve();
+    await Promise.all([first, second]);
+
+    assert.equal(nodes.length, 1);
+    assert.equal(contexts[0].gains.length, 1);
+    assert.equal(coordinator.workletNode, nodes[0]);
+  } finally {
+    restoreContext();
+    restoreWorklet();
+  }
+});
+
+test("close during initialization invalidates the old chain and reopens at epoch zero", async () => {
+  const firstModule = deferred();
+  const contexts = [];
+  class Context {
+    constructor() {
+      this.state = "running";
+      this.destination = {};
+      this.closeCalls = 0;
+      this.audioWorklet = { addModule: () => (contexts.length === 1 ? firstModule.promise : Promise.resolve()) };
+      contexts.push(this);
+    }
+    createGain() { return { gain: new FakeAudioParam(), connect() {}, disconnect() {} }; }
+    close() { this.closeCalls += 1; }
+  }
+  class WorkletNode {
+    constructor() { this.port = new FakePort(); }
+    connect() {}
+    disconnect() {}
+  }
+  const restoreContext = replaceGlobal("AudioContext", Context);
+  const restoreWorklet = replaceGlobal("AudioWorkletNode", WorkletNode);
+
+  try {
+    const coordinator = new BrowserPlaybackCoordinator();
+    const opening = coordinator.unlock();
+    coordinator.setEpoch(6);
+    coordinator.enqueue(item("discard-on-close", 6, 1));
+    const closing = coordinator.close();
+    firstModule.resolve();
+    await Promise.all([opening, closing]);
+
+    assert.equal(contexts[0].closeCalls, 1);
+    assert.equal(coordinator.context, null);
+    assert.equal(coordinator.workletNode, null);
+    assert.equal(coordinator.queue.currentEpoch, 0);
+    assert.deepEqual([coordinator.queue.pending, coordinator.queue.active, coordinator.queue.paused], [[], [], []]);
+
+    await coordinator.unlock();
+    assert.equal(contexts.length, 2);
+    assert.equal(coordinator.queue.currentEpoch, 0);
+  } finally {
+    restoreContext();
+    restoreWorklet();
+  }
+});
+
+test("close detaches stale port handlers before a former response can acknowledge", async () => {
+  const { coordinator, port, acknowledgements } = createCoordinator();
+  coordinator.setEpoch(4);
+  coordinator.enqueue(item("old", 4, 2));
+  const oldHandler = port.onmessage;
+
+  await coordinator.close();
+  oldHandler({ data: { type: "progress", response_id: "old", generation_epoch: 4, segment_id: 2, sample_offset: 1, audio_time: 9 } });
+
+  assert.equal(port.onmessage, null);
+  assert.deepEqual(acknowledgements, []);
+  assert.equal(coordinator.queue.currentEpoch, 0);
+});
+
+test("coordinator rejects invalid sample rates without blocking a following valid segment", () => {
+  const { coordinator, port } = createCoordinator();
+  coordinator.setEpoch(4);
+
+  assert.equal(coordinator.enqueue({ ...item("zero"), sample_rate: 0 }), false);
+  assert.equal(coordinator.enqueue({ ...item("negative", 4, 2), sample_rate: -1 }), false);
+  assert.equal(coordinator.enqueue({ ...item("infinite", 4, 3), sample_rate: Infinity }), false);
+  assert.equal(coordinator.enqueue({ ...item("nan", 4, 4), sample_rate: Number.NaN }), false);
+  assert.equal(coordinator.enqueue({ ...item("valid", 4, 5), sample_rate: 24000 }), true);
+
+  assert.deepEqual(coordinator.queue.active.map(({ response_id }) => response_id), ["valid"]);
+  assert.equal(port.messages.at(-1).item.sample_rate, 24000);
+});
+
+test("coordinator limits progress ACKs to one per 50ms while sending terminal ACKs immediately", () => {
+  const { coordinator, port, acknowledgements } = createCoordinator();
+  coordinator.setEpoch(4);
+  coordinator.enqueue(item("cadence", 4, 5));
+  const event = (type, sample_offset, audio_time) => port.emit({
+    type, response_id: "cadence", generation_epoch: 4, segment_id: 5, sample_offset, audio_time,
+  });
+
+  event("progress", 1, 1);
+  event("progress", 2, 1.01);
+  event("progress", 3, 1.049);
+  event("progress", 4, 1.05);
+  event("stopped", 5, 1.051);
+
+  assert.deepEqual(acknowledgements.map(({ sample_offset, audio_time }) => [sample_offset, audio_time]), [
+    [1, 1], [4, 1.05], [5, 1.051],
+  ]);
+});
+
+test("pre-init pause and stop emit terminal zero-offset acknowledgements", () => {
+  const acknowledgements = [];
+  const coordinator = new BrowserPlaybackCoordinator({
+    context: { currentTime: 12.5 },
+    onPlaybackAck: (ack) => acknowledgements.push(ack),
+  });
+  coordinator.setEpoch(4);
+  coordinator.enqueue(item("pause-before-init", 4, 1));
+  coordinator.pauseResponse("pause-before-init");
+  coordinator.enqueue(item("stop-before-init", 4, 2));
+  coordinator.stopResponse("stop-before-init");
+
+  assert.deepEqual(acknowledgements, [
+    { response_id: "pause-before-init", generation_epoch: 4, segment_id: 1, sample_offset: 0, audio_time: 12.5 },
+    { response_id: "stop-before-init", generation_epoch: 4, segment_id: 2, sample_offset: 0, audio_time: 12.5 },
+  ]);
+  assert.deepEqual(coordinator.queue.pending, []);
+  assert.deepEqual(coordinator.queue.paused, []);
 });
 
 test("worklet renderer plays 24kHz PCM at the correct 48kHz AudioContext speed and reports source offsets", () => {

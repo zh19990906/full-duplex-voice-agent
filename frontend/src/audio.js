@@ -209,22 +209,24 @@ export class BrowserPlaybackCoordinator {
     this.duckLevel = duckLevel;
     this.duckRampSeconds = Math.min(duckRampSeconds, 0.1);
     this.nextLegacySegmentId = 0;
+    this.unlocking = null;
+    this.closing = null;
+    this.lifecycleGeneration = 0;
+    this.progressAcks = new Map();
     this.#attachWorklet();
   }
 
-  async unlock() {
-    this.context ||= new AudioContext();
-    if (this.context.state === "suspended") await this.context.resume();
-    if (!this.workletNode) {
-      await this.context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url));
-      this.gainNode = this.context.createGain();
-      this.gainNode.gain.value = 1;
-      this.workletNode = new AudioWorkletNode(this.context, "pcm-playback-processor");
-      this.workletNode.connect(this.gainNode);
-      this.gainNode.connect(this.context.destination);
-      this.#attachWorklet();
-    }
-    this.#flushPending();
+  unlock() {
+    if (this.closing) return this.closing.then(() => this.unlock());
+    if (this.workletNode) return Promise.resolve();
+    if (this.unlocking) return this.unlocking;
+    const token = this.lifecycleGeneration;
+    const initialization = this.#initialize(token);
+    this.unlocking = initialization;
+    initialization.finally(() => {
+      if (this.unlocking === initialization) this.unlocking = null;
+    });
+    return initialization;
   }
 
   enqueue(payload) {
@@ -245,31 +247,54 @@ export class BrowserPlaybackCoordinator {
 
   pauseResponse(responseId) {
     const paused = this.queue.pauseResponse(responseId);
-    if (paused.length) this.workletNode?.port.postMessage({ type: "pause_response", response_id: responseId });
+    if (paused.length && this.workletNode) this.workletNode.port.postMessage({ type: "pause_response", response_id: responseId });
+    if (paused.length && !this.workletNode) this.#acknowledgePendingTerminal("paused", paused);
     return paused.length > 0;
   }
 
   stopResponse(responseId) {
     const stopped = this.queue.stopResponse(responseId);
-    if (stopped.length) this.workletNode?.port.postMessage({ type: "stop_response", response_id: responseId });
+    if (stopped.length && this.workletNode) this.workletNode.port.postMessage({ type: "stop_response", response_id: responseId });
+    if (stopped.length && !this.workletNode) this.#acknowledgePendingTerminal("stopped", stopped);
     return stopped.length > 0;
   }
 
-  async close() {
-    this.queue.clear();
-    this.workletNode?.port.postMessage({ type: "stop_all" });
-    this.workletNode?.disconnect?.();
-    this.gainNode?.disconnect?.();
-    const context = this.context;
-    this.context = null;
-    this.workletNode = null;
-    this.gainNode = null;
-    await context?.close?.();
+  close() {
+    if (this.closing) return this.closing;
+    this.lifecycleGeneration += 1;
+    const initialization = this.unlocking;
+    this.closing = (async () => {
+      try {
+        await initialization;
+      } catch {
+        // Closing still releases a context whose initialization failed.
+      }
+      const worklet = this.workletNode;
+      const gain = this.gainNode;
+      const context = this.context;
+      worklet?.port.postMessage({ type: "stop_all" });
+      if (worklet?.port) {
+        worklet.port.onmessage = null;
+        worklet.port.close?.();
+      }
+      worklet?.disconnect?.();
+      gain?.disconnect?.();
+      this.context = null;
+      this.workletNode = null;
+      this.gainNode = null;
+      this.queue = new PlaybackQueue();
+      this.nextLegacySegmentId = 0;
+      this.progressAcks.clear();
+      await context?.close?.();
+    })().finally(() => { this.closing = null; });
+    return this.closing;
   }
 
   #normaliseItem(payload) {
     const pcm16 = asInt16(payload?.pcm16 ?? payload?.audio_data);
     if (!pcm16 || payload?.channels && payload.channels !== 1) return null;
+    const sample_rate = payload?.sample_rate ?? payload?.sampleRate ?? 24000;
+    if (!Number.isFinite(sample_rate) || sample_rate <= 0) return null;
     const generation_epoch = Number.isInteger(payload?.generation_epoch ?? payload?.epoch)
       ? (payload.generation_epoch ?? payload.epoch) : 0;
     const segment_id = Number.isInteger(payload?.segment_id ?? payload?.segmentId)
@@ -279,15 +304,43 @@ export class BrowserPlaybackCoordinator {
       generation_epoch,
       segment_id,
       pcm16,
-      sample_rate: payload?.sample_rate ?? payload?.sampleRate ?? 24000,
+      sample_rate,
       channels: 1,
     };
   }
 
-  #attachWorklet() {
-    if (!this.workletNode) return;
-    this.workletNode.port.onmessage = ({ data }) => this.#handleWorkletEvent(data);
-    this.workletNode.port.postMessage({ type: "set_epoch", generation_epoch: this.queue.currentEpoch });
+  async #initialize(token) {
+    const context = this.context ||= new AudioContext();
+    if (context.state === "suspended") await context.resume();
+    if (!this.#isCurrent(token, context) || this.workletNode) return;
+    await context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url));
+    if (!this.#isCurrent(token, context) || this.workletNode) return;
+    const gain = context.createGain();
+    gain.gain.value = 1;
+    const worklet = new AudioWorkletNode(context, "pcm-playback-processor");
+    if (!this.#isCurrent(token, context)) {
+      worklet.port.onmessage = null;
+      worklet.port.close?.();
+      worklet.disconnect?.();
+      gain.disconnect?.();
+      return;
+    }
+    worklet.connect(gain);
+    gain.connect(context.destination);
+    this.gainNode = gain;
+    this.workletNode = worklet;
+    this.#attachWorklet(token, worklet);
+    this.#flushPending();
+  }
+
+  #isCurrent(token, context) {
+    return token === this.lifecycleGeneration && context === this.context && !this.closing;
+  }
+
+  #attachWorklet(token = this.lifecycleGeneration, worklet = this.workletNode) {
+    if (!worklet) return;
+    worklet.port.onmessage = ({ data }) => this.#handleWorkletEvent(data, token, worklet);
+    worklet.port.postMessage({ type: "set_epoch", generation_epoch: this.queue.currentEpoch });
   }
 
   #flushPending() {
@@ -302,9 +355,18 @@ export class BrowserPlaybackCoordinator {
     }, [item.pcm16.buffer]);
   }
 
-  #handleWorkletEvent(event) {
+  #handleWorkletEvent(event, token = this.lifecycleGeneration, worklet = this.workletNode) {
+    if (token !== this.lifecycleGeneration || worklet !== this.workletNode) return;
     if (!event || event.generation_epoch < this.queue.currentEpoch) return;
     if (!["progress", "completed", "stopped", "paused"].includes(event.type)) return;
+    const key = `${event.response_id}\u0000${event.generation_epoch}\u0000${event.segment_id}`;
+    if (event.type === "progress") {
+      const previous = this.progressAcks.get(key);
+      if (previous !== undefined && event.audio_time - previous < 0.05) return;
+      this.progressAcks.set(key, event.audio_time);
+    } else {
+      this.progressAcks.delete(key);
+    }
     const acknowledgement = {
       response_id: event.response_id,
       generation_epoch: event.generation_epoch,
@@ -315,6 +377,20 @@ export class BrowserPlaybackCoordinator {
     this.onPlaybackAck(acknowledgement);
     if (["completed", "stopped", "paused"].includes(event.type)) {
       this.queue.complete(event.response_id, event.generation_epoch, event.segment_id);
+    }
+  }
+
+  #acknowledgePendingTerminal(type, items) {
+    const audio_time = this.context?.currentTime ?? 0;
+    for (const item of items) {
+      this.onPlaybackAck({
+        response_id: item.response_id,
+        generation_epoch: item.generation_epoch,
+        segment_id: item.segment_id,
+        sample_offset: 0,
+        audio_time,
+      });
+      this.queue.complete(item.response_id, item.generation_epoch, item.segment_id);
     }
   }
 
