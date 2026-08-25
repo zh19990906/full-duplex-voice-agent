@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -47,6 +48,39 @@ class GateAsyncRuntime:
         self.started.set()
         await self.release.wait()
         return "late result"
+
+
+class LazySegments:
+    def __init__(self, text):
+        self._text = text
+        self._yielded = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._yielded:
+            raise StopIteration
+        self._yielded = True
+        time.sleep(0.05)
+        return {"text": self._text}
+
+
+class LazySegmentsRuntime:
+    def transcribe(self, pcm, **options):
+        return LazySegments("lazy"), {"language": "en"}
+
+
+def _apply_revision(chunks):
+    committed = ""
+    display = ""
+    for chunk in chunks:
+        if chunk.replaces_committed:
+            committed = chunk.committed_text
+        else:
+            committed += chunk.text
+        display = committed + chunk.unstable_text
+    return display
 
 
 class FasterWhisperStreamingProviderTests(unittest.IsolatedAsyncioTestCase):
@@ -137,6 +171,25 @@ class FasterWhisperStreamingProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(ticks, 3)
         self.assertEqual(result.text, "hello")
 
+    async def test_sync_lazy_segment_iteration_is_off_event_loop(self):
+        provider = FasterWhisperStreamingProvider("model", runtime=LazySegmentsRuntime())
+        ticks = 0
+        running = True
+
+        async def tick():
+            nonlocal ticks
+            while running:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        ticker = asyncio.create_task(tick())
+        await provider.push_pcm(PCM)
+        result = await provider.finalize_turn()
+        running = False
+        await ticker
+        self.assertGreaterEqual(ticks, 5)
+        self.assertEqual(result.text, "lazy")
+
     async def test_async_runtime_serializes_concurrent_push_finalize_and_cancel(self):
         runtime = AsyncRuntime(["a", "ab", "abc"])
         provider = FasterWhisperStreamingProvider("model", runtime=runtime, cadence_ms=200)
@@ -169,6 +222,82 @@ class FasterWhisperStreamingProviderTests(unittest.IsolatedAsyncioTestCase):
         await cancelling
         self.assertEqual(provider.context_bytes, b"")
 
+    async def test_final_major_correction_replaces_committed_text(self):
+        runtime = SyncRuntime(["old direction", "old direction text", "new request"])
+        provider = FasterWhisperStreamingProvider("model", runtime=runtime, cadence_ms=200)
+        chunks = []
+        for _ in range(10):
+            result = await provider.push_pcm(PCM)
+            if result is not None:
+                chunks.append(result)
+        for _ in range(10):
+            result = await provider.push_pcm(PCM)
+            if result is not None:
+                chunks.append(result)
+        chunks.append(await provider.finalize_turn())
+
+        self.assertTrue(chunks[-1].replaces_committed)
+        self.assertEqual(chunks[-1].committed_text, "new request")
+        self.assertEqual(_apply_revision(chunks), "new request")
+        self.assertTrue(chunks[-1].to_dict()["replaces_committed"])
+
+    async def test_final_shrink_replaces_committed_text(self):
+        runtime = SyncRuntime(["abcdef", "abcdefghi", "abc"])
+        provider = FasterWhisperStreamingProvider("model", runtime=runtime, cadence_ms=200)
+        chunks = []
+        for _ in range(20):
+            result = await provider.push_pcm(PCM)
+            if result is not None:
+                chunks.append(result)
+        chunks.append(await provider.finalize_turn())
+
+        self.assertTrue(chunks[-1].replaces_committed)
+        self.assertEqual(_apply_revision(chunks), "abc")
+
+    async def test_publication_identity_is_monotonic_across_turns_and_reset(self):
+        runtime = SyncRuntime(["one", "one", "two"])
+        provider = FasterWhisperStreamingProvider("model", runtime=runtime, cadence_ms=200)
+        for _ in range(10):
+            first = await provider.push_pcm(PCM)
+        first_final = await provider.finalize_turn()
+        await provider.push_pcm(PCM)
+        await provider.cancel()
+        provider.reset()
+        await provider.push_pcm(PCM)
+        second_final = await provider.finalize_turn()
+
+        self.assertEqual([first.revision_id, first_final.revision_id, second_final.revision_id], [1, 2, 3])
+        self.assertEqual(len({first.chunk_id, first_final.chunk_id, second_final.chunk_id}), 3)
+
+    async def test_shifted_rolling_window_stitches_global_hypothesis(self):
+        runtime = SyncRuntime(["abcd", "cdef", "efgh"])
+        provider = FasterWhisperStreamingProvider(
+            "model", runtime=runtime, cadence_ms=200, context_seconds=0.04
+        )
+        chunks = []
+        for _ in range(20):
+            result = await provider.push_pcm(PCM)
+            if result is not None:
+                chunks.append(result)
+        chunks.append(await provider.finalize_turn())
+
+        self.assertFalse(chunks[-1].replaces_committed)
+        self.assertEqual(_apply_revision(chunks), "abcdefgh")
+        self.assertEqual("".join(chunk.text for chunk in chunks), "abcdefgh")
+
+    async def test_lifetime_decode_metrics_include_source_and_end_to_end_rtf(self):
+        provider = FasterWhisperStreamingProvider(
+            "model", runtime=SyncRuntime(["metric"]), cadence_ms=200
+        )
+        for _ in range(10):
+            await provider.push_pcm(PCM)
+        self.assertAlmostEqual(provider.source_audio_seconds, 0.2)
+        self.assertEqual(provider.total_decode_seconds, sum(provider.decode_durations))
+        self.assertAlmostEqual(
+            provider.end_to_end_decode_rtf,
+            provider.total_decode_seconds / provider.source_audio_seconds,
+        )
+
     def test_transcript_chunk_keeps_positional_contract_and_validates_revision(self):
         chunk = TranscriptChunk("id", "text", 1.0, False)
         self.assertEqual(chunk.revision_id, 0)
@@ -187,6 +316,27 @@ class FasterWhisperStreamingProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("local faster-whisper model directory", result.stdout)
+
+    def test_benchmark_absolute_script_path_bootstraps_project_from_outside_cwd(self):
+        script = Path(__file__).parents[1] / "scripts" / "benchmark_streaming_asr.py"
+        with tempfile.TemporaryDirectory() as outside_cwd:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--model",
+                    "/definitely/missing/model",
+                    "--audio",
+                    "/definitely/missing/audio.wav",
+                ],
+                cwd=outside_cwd,
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("model directory does not exist", result.stderr)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
 
 
 if __name__ == "__main__":

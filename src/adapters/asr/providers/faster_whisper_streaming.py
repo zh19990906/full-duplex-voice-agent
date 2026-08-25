@@ -60,11 +60,15 @@ class FasterWhisperStreamingProvider:
         self._audio = bytearray()
         self._bytes_since_decode = 0
         self._committer = StablePrefixCommitter()
-        self._revision_id = 0
+        self._global_hypothesis = ""
+        self._rolling_window_shifted = False
+        self._publication_sequence = 0
         self._cancelled = False
         self._turn_generation = 0
         self._decode_lock = asyncio.Lock()
         self.decode_durations: list[float] = []
+        self.total_decode_seconds = 0.0
+        self.source_audio_seconds = 0.0
         self.last_decode_duration = 0.0
         self.last_rtf = 0.0
 
@@ -72,6 +76,13 @@ class FasterWhisperStreamingProvider:
     def context_bytes(self) -> bytes:
         """Return a copy of the bounded rolling PCM context for observability."""
         return bytes(self._audio)
+
+    @property
+    def end_to_end_decode_rtf(self) -> float:
+        """Return total model decode time divided by received source duration."""
+        if not self.source_audio_seconds:
+            return 0.0
+        return self.total_decode_seconds / self.source_audio_seconds
 
     async def push_pcm(self, pcm: bytes | RealtimeAudioFrame) -> TranscriptChunk | None:
         """Accept one ordered V1 PCM frame and decode when cadence is due."""
@@ -90,13 +101,13 @@ class FasterWhisperStreamingProvider:
             if self._audio:
                 chunk = await self._decode(final=True)
             else:
-                self._revision_id += 1
+                publication_id = self._next_publication_id()
                 chunk = TranscriptChunk(
-                    f"faster-whisper-{self._revision_id}",
+                    f"faster-whisper-{publication_id}",
                     "",
                     time.time(),
                     True,
-                    self._revision_id,
+                    publication_id,
                     "",
                 )
             self._reset_turn_state()
@@ -127,37 +138,53 @@ class FasterWhisperStreamingProvider:
         result = await self._invoke_runtime(audio)
         duration = time.perf_counter() - started
         self.decode_durations.append(duration)
+        self.total_decode_seconds += duration
         self.last_decode_duration = duration
         self.last_rtf = duration / (len(audio) / (PCM16_SAMPLE_RATE * 2)) if audio else 0.0
         if self._cancelled or generation != self._turn_generation:
             raise RuntimeError("faster-whisper ASR provider has been cancelled")
 
-        hypothesis = _normalize_text(result)
+        window_hypothesis = result
+        hypothesis = (
+            _stitch_shifted_hypothesis(self._global_hypothesis, window_hypothesis)
+            if self._rolling_window_shifted
+            else window_hypothesis
+        )
+        self._global_hypothesis = hypothesis
+        replaces_committed = final and not hypothesis.startswith(self._committer.committed_text)
         if final:
             stable_delta = self._committer.finalize(hypothesis)
             unstable_text = ""
+            committed_text = hypothesis if replaces_committed else None
+            if replaces_committed:
+                stable_delta = ""
         else:
             stable_delta = self._committer.update(hypothesis)
             unstable_text = self._committer.unstable_text
-        self._revision_id += 1
+            committed_text = None
+        publication_id = self._next_publication_id()
         self._bytes_since_decode = 0
         return TranscriptChunk(
-            f"faster-whisper-{self._revision_id}",
+            f"faster-whisper-{publication_id}",
             stable_delta,
             time.time(),
             final,
-            self._revision_id,
+            publication_id,
             unstable_text,
+            committed_text,
+            replaces_committed,
         )
 
     async def _invoke_runtime(self, audio: bytes) -> Any:
         method = self._runtime_method()
         if inspect.iscoroutinefunction(method):
-            return await method(audio, **self.options)
+            return await _normalize_async_result(await method(audio, **self.options))
         result = await asyncio.to_thread(method, audio, **self.options)
         if inspect.isawaitable(result):
-            return await result
-        return result
+            return await _normalize_async_result(await result)
+        # faster-whisper returns a lazy segments generator. Consume and
+        # normalize it in the worker thread, not on the realtime event loop.
+        return await asyncio.to_thread(_normalize_text, result)
 
     def _runtime_method(self):
         if self.runtime is None:
@@ -174,8 +201,10 @@ class FasterWhisperStreamingProvider:
 
     def _append(self, pcm: bytes) -> None:
         self._audio.extend(pcm)
+        self.source_audio_seconds += len(pcm) / (PCM16_SAMPLE_RATE * 2)
         if len(self._audio) > self._max_context_bytes:
             del self._audio[: len(self._audio) - self._max_context_bytes]
+            self._rolling_window_shifted = True
         self._bytes_since_decode += len(pcm)
 
     def _require_active(self) -> None:
@@ -186,7 +215,12 @@ class FasterWhisperStreamingProvider:
         self._audio.clear()
         self._bytes_since_decode = 0
         self._committer.reset()
-        self._revision_id = 0
+        self._global_hypothesis = ""
+        self._rolling_window_shifted = False
+
+    def _next_publication_id(self) -> int:
+        self._publication_sequence += 1
+        return self._publication_sequence
 
 
 def _validated_pcm(value: bytes | RealtimeAudioFrame) -> bytes:
@@ -226,6 +260,27 @@ def _normalize_text(result: Any) -> str:
     if isinstance(result, Iterable):
         return "".join(_normalize_text(item) for item in result)
     raise TypeError("faster-whisper result must expose transcript text")
+
+
+async def _normalize_async_result(result: Any) -> str:
+    """Normalize an async runtime result without treating async streams as sync."""
+    if hasattr(result, "__aiter__"):
+        items = []
+        async for item in result:
+            items.append(item)
+        return _normalize_text(items)
+    return await asyncio.to_thread(_normalize_text, result)
+
+
+def _stitch_shifted_hypothesis(previous: str, window: str) -> str:
+    """Map a rolling-window hypothesis onto the previous global hypothesis."""
+    if not previous:
+        return window
+    overlap_limit = min(len(previous), len(window))
+    for size in range(overlap_limit, 0, -1):
+        if previous.endswith(window[:size]):
+            return previous + window[size:]
+    return window
 
 
 def _load_faster_whisper_runtime(

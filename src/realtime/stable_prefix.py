@@ -44,9 +44,12 @@ class StablePrefixCommitter:
             addition = final_hypothesis
         else:
             # A decoder correction cannot retract text already sent downstream.
-            # Preserve append-only output while avoiding a duplicated prefix.
-            addition = final_hypothesis[len(self.committed_text) :]
-        self.committed_text += addition
+            # The provider publishes an authoritative replacement chunk for
+            # this case. Keep the committer's internal state exact as well.
+            addition = ""
+            self.committed_text = final_hypothesis
+        if final_hypothesis.startswith(self.committed_text):
+            self.committed_text += addition
         self.previous_hypothesis = final_hypothesis
         self.unstable_text = ""
         self._finalized = True

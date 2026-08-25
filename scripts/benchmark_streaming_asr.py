@@ -6,7 +6,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 from pathlib import Path
+import sys
 import wave
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 
 def _cadence(value: str) -> int:
@@ -68,7 +74,15 @@ async def _run(args: argparse.Namespace) -> None:
         if chunk is not None:
             print(chunk.to_dict())
     print((await provider.finalize_turn()).to_dict())
-    print({"decode_durations": provider.decode_durations, "last_rtf": provider.last_rtf})
+    print(
+        {
+            "decode_durations": provider.decode_durations,
+            "last_window_rtf": provider.last_rtf,
+            "total_decode_seconds": provider.total_decode_seconds,
+            "source_audio_seconds": provider.source_audio_seconds,
+            "end_to_end_decode_rtf": provider.end_to_end_decode_rtf,
+        }
+    )
 
 
 def main() -> None:
