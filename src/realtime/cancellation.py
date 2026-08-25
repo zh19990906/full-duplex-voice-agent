@@ -74,13 +74,29 @@ class ActiveTaskSlot:
                 self._task = None
 
     async def _record_task_outcome(self, task: asyncio.Future[object]) -> None:
+        caller_cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    break
+                caller_cancelled = True
+            except BaseException:
+                break
+
+        if task.cancelled():
+            if caller_cancelled:
+                raise asyncio.CancelledError
+            return
+
         try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if not task.cancelled():
-                raise
+            task.result()
         except BaseException as error:
             self._last_error = error
+
+        if caller_cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _discard(work: Awaitable[object]) -> None:

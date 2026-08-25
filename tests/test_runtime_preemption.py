@@ -117,6 +117,102 @@ class RuntimePreemptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(slot.task)
         self.assertIsInstance(slot.last_error, RuntimeError)
 
+    async def test_cancelled_replace_waits_for_old_cleanup_before_releasing_slot(self):
+        """Catches a cancelled replace caller releasing ownership during old cleanup."""
+        slot = ActiveTaskSlot()
+        old_cleanup_started = asyncio.Event()
+        allow_old_cleanup = asyncio.Event()
+        uninstalled_started = asyncio.Event()
+        later_started = asyncio.Event()
+        later_stopped = asyncio.Event()
+
+        async def old_work():
+            try:
+                await asyncio.Future()
+            finally:
+                old_cleanup_started.set()
+                await allow_old_cleanup.wait()
+
+        async def uninstalled_work():
+            uninstalled_started.set()
+            await asyncio.Future()
+
+        async def later_work():
+            try:
+                later_started.set()
+                await asyncio.Future()
+            finally:
+                later_stopped.set()
+
+        await slot.replace(old_work())
+        uninstalled_coroutine = uninstalled_work()
+        cancelled_replace = asyncio.create_task(slot.replace(uninstalled_coroutine))
+        await old_cleanup_started.wait()
+        cancelled_replace.cancel()
+        await asyncio.sleep(0)
+        replace_waits_for_cleanup = not cancelled_replace.done()
+
+        later_replace = asyncio.create_task(slot.replace(later_work()))
+        await asyncio.sleep(0)
+        later_waits_for_cleanup = not later_started.is_set()
+        allow_old_cleanup.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_replace
+        later_task = await later_replace
+        self.assertIs(slot.task, later_task)
+        self.assertTrue(replace_waits_for_cleanup)
+        self.assertTrue(later_waits_for_cleanup)
+        self.assertFalse(uninstalled_started.is_set())
+        self.assertIsNone(uninstalled_coroutine.cr_frame)
+
+        await slot.cancel()
+        self.assertTrue(later_stopped.is_set())
+
+    async def test_cancelled_cancel_waits_for_old_cleanup_before_releasing_slot(self):
+        """Catches a cancelled cancel caller releasing ownership during old cleanup."""
+        slot = ActiveTaskSlot()
+        old_cleanup_started = asyncio.Event()
+        allow_old_cleanup = asyncio.Event()
+        later_started = asyncio.Event()
+        later_stopped = asyncio.Event()
+
+        async def old_work():
+            try:
+                await asyncio.Future()
+            finally:
+                old_cleanup_started.set()
+                await allow_old_cleanup.wait()
+
+        async def later_work():
+            try:
+                later_started.set()
+                await asyncio.Future()
+            finally:
+                later_stopped.set()
+
+        await slot.replace(old_work())
+        cancelled_cancel = asyncio.create_task(slot.cancel())
+        await old_cleanup_started.wait()
+        cancelled_cancel.cancel()
+        await asyncio.sleep(0)
+        cancel_waits_for_cleanup = not cancelled_cancel.done()
+
+        later_replace = asyncio.create_task(slot.replace(later_work()))
+        await asyncio.sleep(0)
+        later_waits_for_cleanup = not later_started.is_set()
+        allow_old_cleanup.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_cancel
+        later_task = await later_replace
+        self.assertIs(slot.task, later_task)
+        self.assertTrue(cancel_waits_for_cleanup)
+        self.assertTrue(later_waits_for_cleanup)
+
+        await slot.cancel()
+        self.assertTrue(later_stopped.is_set())
+
     async def test_scheduler_orders_the_six_realtime_priority_tiers(self):
         """Catches a scheduler whose priority values violate realtime urgency ordering."""
         scheduler = RealtimeScheduler()
