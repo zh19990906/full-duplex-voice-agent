@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -12,6 +13,7 @@ from src.realtime.cancellation import CancellationToken
 from src.realtime.identifiers import GenerationClock, IdentifierAllocator
 from src.realtime.response_pipeline import RealtimeResponsePipeline, ResponseStreamEnd
 from src.realtime.text_segmenter import LanguageAwareTextSegmenter, TextSegment
+from src.tts_runtime.stream import AudioChunk
 
 
 Publish = Callable[[Any], Awaitable[None] | None]
@@ -52,6 +54,7 @@ class RealModelSession:
         self._active_invalidated = False
         self._active_consumer_task: asyncio.Task[None] | None = None
         self._active_tts_start_task: asyncio.Task[Any] | None = None
+        self._active_tts_request_id: str | None = None
         self.last_response_end: ResponseStreamEnd | None = None
         self._interrupted = False
 
@@ -106,10 +109,13 @@ class RealModelSession:
                 self._active_invalidated = True
             consumer = self._active_consumer_task
             startup = self._active_tts_start_task
+            tts_request_id = self._active_tts_request_id
         if startup is not None and not startup.done():
             startup.cancel()
         if consumer is not None and not consumer.done():
             consumer.cancel()
+        if tts_request_id is not None:
+            await self._cancel_tts_request(tts_request_id)
         for provider in (self.llm, self.tts):
             await self._interrupt_provider(provider)
 
@@ -134,6 +140,8 @@ class RealModelSession:
                 self._active_consumer_task = None
             if self._active_tts_start_task is not None and self._active_tts_start_task.done():
                 self._active_tts_start_task = None
+            if self._active_epoch == epoch:
+                self._active_tts_request_id = None
             if self._active_epoch == epoch and self._active_token is token:
                 self._active_token = None
                 self._active_epoch = None
@@ -165,15 +173,19 @@ class RealModelSession:
                     assert isinstance(item, TextSegment)
                     if not self._is_current(epoch, cancellation_token):
                         continue
-                    audio = await self._await_tts_start(item.text, epoch)
-                    if not self._is_current(epoch, cancellation_token):
-                        continue
-                    async for chunk in audio:
+                    request_id = self._tts_request_id(item)
+                    try:
+                        audio = await self._await_tts_start(item, epoch, request_id)
                         if not self._is_current(epoch, cancellation_token):
-                            break
-                        await self._emit(chunk)
-                        if not self._is_current(epoch, cancellation_token):
-                            break
+                            continue
+                        async for chunk in audio:
+                            if not self._is_current(epoch, cancellation_token):
+                                break
+                            await self._emit(self._tag_audio(chunk, item, request_id))
+                            if not self._is_current(epoch, cancellation_token):
+                                break
+                    finally:
+                        await self._clear_active_tts_request(epoch, request_id)
                 finally:
                     queue.task_done()
         except asyncio.CancelledError:
@@ -185,23 +197,33 @@ class RealModelSession:
             await self._interrupt_provider(self.llm)
             raise
 
-    async def _await_tts_start(self, text: str, epoch: int) -> Any:
-        task = asyncio.create_task(self._start_tts(text))
-        await self._set_active_tts_start(epoch, task)
+    async def _await_tts_start(
+        self, segment: TextSegment, epoch: int, request_id: str
+    ) -> Any:
+        task = asyncio.create_task(self._start_tts(segment, request_id))
+        await self._set_active_tts_start(epoch, task, request_id)
         try:
             return await task
         finally:
             await self._clear_active_tts_start(epoch, task)
 
-    async def _set_active_tts_start(self, epoch: int, task: asyncio.Task[Any]) -> None:
+    async def _set_active_tts_start(
+        self, epoch: int, task: asyncio.Task[Any], request_id: str
+    ) -> None:
         async with self._state_lock:
             if self._active_epoch == epoch:
                 self._active_tts_start_task = task
+                self._active_tts_request_id = request_id
 
     async def _clear_active_tts_start(self, epoch: int, task: asyncio.Task[Any]) -> None:
         async with self._state_lock:
             if self._active_epoch == epoch and self._active_tts_start_task is task:
                 self._active_tts_start_task = None
+
+    async def _clear_active_tts_request(self, epoch: int, request_id: str) -> None:
+        async with self._state_lock:
+            if self._active_epoch == epoch and self._active_tts_request_id == request_id:
+                self._active_tts_request_id = None
 
     async def _record_terminal(self, marker: ResponseStreamEnd) -> None:
         async with self._state_lock:
@@ -223,11 +245,65 @@ class RealModelSession:
         except (asyncio.CancelledError, Exception):
             return
 
-    async def _start_tts(self, text: str) -> Any:
-        audio = self.tts.stream_audio(text)
+    async def _start_tts(self, segment: TextSegment, request_id: str) -> Any:
+        options = {
+            "request_id": request_id,
+            "response_id": segment.response_id,
+            "generation_epoch": segment.generation_epoch,
+            "segment_id": segment.segment_id,
+        }
+        audio = self._call_supported(self.tts.stream_audio, segment.text, **options)
         if inspect.isawaitable(audio):
             return await audio
         return audio
+
+    @staticmethod
+    def _tts_request_id(segment: TextSegment) -> str:
+        if segment.response_id is None or segment.generation_epoch is None:
+            raise RuntimeError("TTS segment is missing realtime identity")
+        return f"{segment.response_id}:{segment.generation_epoch}:{segment.segment_id}"
+
+    @staticmethod
+    def _tag_audio(chunk: Any, segment: TextSegment, request_id: str) -> AudioChunk:
+        if not isinstance(chunk, AudioChunk):
+            raise TypeError("TTS provider must yield AudioChunk")
+        expected = {
+            "request_id": request_id,
+            "response_id": segment.response_id,
+            "generation_epoch": segment.generation_epoch,
+            "segment_id": segment.segment_id,
+        }
+        for name, value in expected.items():
+            actual = getattr(chunk, name)
+            if actual is not None and actual != value:
+                raise RuntimeError(f"TTS provider returned a mismatched {name}")
+        return replace(chunk, **expected)
+
+    async def _cancel_tts_request(self, request_id: str) -> None:
+        method = getattr(self.tts, "cancel", None) or getattr(self.tts, "interrupt", None)
+        if not callable(method):
+            return
+        result = self._call_supported(method, request_id)
+        if inspect.isawaitable(result):
+            await result
+
+    @staticmethod
+    def _call_supported(method: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return method(*args, **kwargs)
+        if any(parameter.kind is parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return method(*args, **kwargs)
+        positional_count = sum(
+            parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+            for parameter in signature.parameters.values()
+        )
+        supported_args = args[:positional_count]
+        return method(
+            *supported_args,
+            **{key: value for key, value in kwargs.items() if key in signature.parameters},
+        )
 
     def _is_current(self, epoch: int, token: CancellationToken) -> bool:
         return self.generation_clock.is_current(epoch) and not token.is_cancelled()

@@ -44,8 +44,8 @@ class SegmentedTTS:
     def __init__(self):
         self.calls = []
 
-    async def stream_audio(self, text):
-        self.calls.append(text)
+    async def stream_audio(self, text, **options):
+        self.calls.append((text, options))
 
         async def chunks():
             yield AudioChunk(f"audio-{len(self.calls)}", text.encode(), 3.0, True)
@@ -69,6 +69,30 @@ class BlockingTTS:
 
     async def interrupt(self):
         self.interrupted = True
+
+
+class RequestAwareBlockingTTS:
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = []
+        self.cancelled = []
+
+    async def stream_audio(self, text, **options):
+        self.calls.append((text, options))
+
+        async def chunks():
+            self.entered.set()
+            await self.release.wait()
+            yield AudioChunk("late", b"late", 3.0, True)
+
+        return chunks()
+
+    async def cancel(self, request_id):
+        self.cancelled.append(request_id)
+
+    async def interrupt(self):
+        return None
 
 
 class BlockingStartupThenWorkingTTS:
@@ -161,11 +185,32 @@ class RealModelSessionTests(unittest.IsolatedAsyncioTestCase):
         response = await session.run("question")
 
         self.assertEqual(response, "Hello there")
-        self.assertEqual(tts.calls, ["Hello", " there"])
+        self.assertEqual([text for text, _options in tts.calls], ["Hello", " there"])
         self.assertEqual(
             [event.audio_data for event in events if isinstance(event, AudioChunk)],
             [b"Hello", b" there"],
         )
+
+    async def test_segment_identity_is_forwarded_to_tts_and_published_audio(self):
+        events = []
+        tts = SegmentedTTS()
+        session = RealModelSession(
+            FakeLLM(),
+            tts,
+            events.append,
+            segmenter=LanguageAwareTextSegmenter(first_min_words=1, next_min_words=1),
+        )
+
+        await session.run("question")
+
+        audio = [event for event in events if isinstance(event, AudioChunk)]
+        self.assertEqual(len(audio), 2)
+        for index, ((_, options), chunk) in enumerate(zip(tts.calls, audio)):
+            self.assertEqual(options["segment_id"], index)
+            self.assertEqual(chunk.segment_id, index)
+            self.assertEqual(chunk.request_id, options["request_id"])
+            self.assertEqual(chunk.response_id, options["response_id"])
+            self.assertEqual(chunk.generation_epoch, options["generation_epoch"])
 
     async def test_empty_qwen_final_sentinel_completes_response_without_duplicate_tts(self):
         tts = SegmentedTTS()
@@ -179,7 +224,7 @@ class RealModelSessionTests(unittest.IsolatedAsyncioTestCase):
         response = await session.run("question")
 
         self.assertEqual(response, "你好。")
-        self.assertEqual(tts.calls, ["你好。"])
+        self.assertEqual([text for text, _options in tts.calls], ["你好。"])
         self.assertIsNotNone(session.last_response_end)
         self.assertEqual(session.last_response_end.final_segment_id, 0)
         self.assertEqual(session.last_response_end.status, "completed")
@@ -204,6 +249,23 @@ class RealModelSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.generation_clock.current, active_epoch + 1)
         self.assertTrue(tts.interrupted)
         self.assertEqual([event for event in events if isinstance(event, AudioChunk)], [])
+
+    async def test_interrupt_cancels_the_active_tts_request_by_its_identity(self):
+        tts = RequestAwareBlockingTTS()
+        session = RealModelSession(
+            FakeLLM(),
+            tts,
+            lambda _value: None,
+            segmenter=LanguageAwareTextSegmenter(first_min_words=1, next_min_words=1),
+        )
+
+        task = asyncio.create_task(session.run("question"))
+        await tts.entered.wait()
+        await session.interrupt()
+        tts.release.set()
+        await task
+
+        self.assertEqual(tts.cancelled, [tts.calls[0][1]["request_id"]])
 
     async def test_interrupt_cancels_blocked_tts_start_and_allows_a_later_run(self):
         events = []
