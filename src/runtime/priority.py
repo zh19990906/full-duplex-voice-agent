@@ -16,6 +16,6 @@ class Priority(IntEnum):
     # Established names remain valid where their original semantics match.
     INTERRUPT = PLAYBACK_STOP_DUCK
     AUDIO = SPEECH_START_AND_X2
-    TURN_EVENT = SEMANTIC_POLICY
+    TURN_EVENT = SPEECH_START_AND_X2
     GENERATION = MAIN_LLM_GENERATION
     BACKGROUND = LATER_TTS_BACKGROUND

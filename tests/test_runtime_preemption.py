@@ -24,6 +24,99 @@ class RuntimePreemptionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(stopped.wait(), 0.1)
         self.assertIsNotNone(slot.task)
 
+    async def test_active_task_slot_serializes_concurrent_replacements_without_orphaning_work(self):
+        """Catches concurrent replacements returning one task while orphaning the other."""
+        slot = ActiveTaskSlot()
+        old_cleanup_started = asyncio.Event()
+        allow_old_cleanup = asyncio.Event()
+        first_stopped = asyncio.Event()
+        second_stopped = asyncio.Event()
+
+        async def old_work():
+            try:
+                await asyncio.Future()
+            finally:
+                old_cleanup_started.set()
+                await allow_old_cleanup.wait()
+
+        async def first_work():
+            try:
+                await asyncio.Future()
+            finally:
+                first_stopped.set()
+
+        async def second_work():
+            try:
+                await asyncio.Future()
+            finally:
+                second_stopped.set()
+
+        await slot.replace(old_work())
+        first_replacement = asyncio.create_task(slot.replace(first_work()))
+        await old_cleanup_started.wait()
+        second_replacement = asyncio.create_task(slot.replace(second_work()))
+        allow_old_cleanup.set()
+
+        first_task, second_task = await asyncio.gather(
+            first_replacement,
+            second_replacement,
+        )
+
+        self.assertIsNot(first_task, second_task)
+        self.assertIs(slot.task, second_task)
+        self.assertTrue(first_stopped.is_set())
+
+        await slot.cancel()
+        self.assertTrue(second_stopped.is_set())
+
+    async def test_active_task_slot_records_old_failure_and_installs_replacement(self):
+        """Catches old-task failures that leak supplied replacement coroutines."""
+        slot = ActiveTaskSlot()
+        old_failed = asyncio.Event()
+        replacement_stopped = asyncio.Event()
+
+        async def failed_work():
+            old_failed.set()
+            raise RuntimeError("old work failed")
+
+        async def replacement_work():
+            try:
+                await asyncio.Future()
+            finally:
+                replacement_stopped.set()
+
+        await slot.replace(failed_work())
+        await old_failed.wait()
+        replacement_coroutine = replacement_work()
+        try:
+            replacement_task = await slot.replace(replacement_coroutine)
+
+            self.assertIs(slot.task, replacement_task)
+            self.assertIsInstance(slot.last_error, RuntimeError)
+            await slot.cancel()
+            self.assertIsNone(slot.task)
+            self.assertTrue(replacement_stopped.is_set())
+            self.assertIsNone(replacement_coroutine.cr_frame)
+        finally:
+            if replacement_coroutine.cr_frame is not None:
+                replacement_coroutine.close()
+
+    async def test_active_task_slot_cancel_records_failure_and_clears_slot(self):
+        """Catches cancellation that propagates failure and leaves a stale task slot."""
+        slot = ActiveTaskSlot()
+        failed = asyncio.Event()
+
+        async def failed_work():
+            failed.set()
+            raise RuntimeError("work failed")
+
+        await slot.replace(failed_work())
+        await failed.wait()
+        await slot.cancel()
+
+        self.assertIsNone(slot.task)
+        self.assertIsInstance(slot.last_error, RuntimeError)
+
     async def test_scheduler_orders_the_six_realtime_priority_tiers(self):
         """Catches a scheduler whose priority values violate realtime urgency ordering."""
         scheduler = RealtimeScheduler()
@@ -109,7 +202,7 @@ class RuntimePreemptionTests(unittest.IsolatedAsyncioTestCase):
         """Catches removal of established scheduler priority imports."""
         self.assertIs(Priority.INTERRUPT, Priority.PLAYBACK_STOP_DUCK)
         self.assertIs(Priority.AUDIO, Priority.SPEECH_START_AND_X2)
-        self.assertIs(Priority.TURN_EVENT, Priority.SEMANTIC_POLICY)
+        self.assertIs(Priority.TURN_EVENT, Priority.SPEECH_START_AND_X2)
         self.assertIs(Priority.GENERATION, Priority.MAIN_LLM_GENERATION)
         self.assertIs(Priority.BACKGROUND, Priority.LATER_TTS_BACKGROUND)
 
