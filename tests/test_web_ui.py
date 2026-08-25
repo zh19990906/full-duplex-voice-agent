@@ -19,6 +19,7 @@ class WebUiTests(unittest.TestCase):
             "src/websocket.js",
             "src/audio.js",
             "src/capture-worklet.js",
+            "src/playback-worklet.js",
             "src/timeline.js",
         }
 
@@ -69,7 +70,8 @@ class WebUiTests(unittest.TestCase):
         self.assertIn("PcmFrameEncoder", capture_worklet)
         self.assertIn("StreamingResampler", capture_worklet)
         self.assertIn("Int16Array", audio)
-        self.assertIn("createBuffer", audio)
+        self.assertIn("BrowserPlaybackCoordinator", audio)
+        self.assertIn("playback-worklet.js", audio)
         self.assertIn("context.resume", audio)
         self.assertIn("async unlock", audio)
 

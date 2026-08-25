@@ -103,43 +103,254 @@ export class PcmMicrophoneInput {
 
 export const MicrophoneInput = PcmMicrophoneInput;
 
-export class BrowserAudioOutput {
+const asInt16 = (audio) => {
+  if (audio instanceof Int16Array) return new Int16Array(audio);
+  if (audio instanceof ArrayBuffer) return new Int16Array(audio.slice(0));
+  if (typeof audio !== "string" || !audio) return null;
+  const binary = atob(audio);
+  const pcm = new Int16Array(binary.length / 2);
+  for (let index = 0; index < pcm.length; index += 1) {
+    const low = binary.charCodeAt(index * 2);
+    const high = binary.charCodeAt(index * 2 + 1);
+    pcm[index] = (high << 8) | low;
+  }
+  return pcm;
+};
+
+const identityMatches = (item, responseId, epoch, segmentId) => (
+  item.response_id === responseId
+  && item.generation_epoch === epoch
+  && item.segment_id === segmentId
+);
+
+export class PlaybackQueue {
   constructor() {
-    this.context = null;
-    this.nextStart = 0;
+    this.currentEpoch = 0;
+    this.pending = [];
+    this.active = [];
+    this.paused = [];
+  }
+
+  get staleAudioCount() {
+    return [...this.pending, ...this.active, ...this.paused]
+      .filter((item) => item.generation_epoch < this.currentEpoch).length;
+  }
+
+  setEpoch(epoch) {
+    if (!Number.isInteger(epoch) || epoch < this.currentEpoch) return false;
+    this.currentEpoch = epoch;
+    const keepCurrent = (item) => item.generation_epoch >= epoch;
+    this.pending = this.pending.filter(keepCurrent);
+    this.active = this.active.filter(keepCurrent);
+    this.paused = this.paused.filter(keepCurrent);
+    return true;
+  }
+
+  enqueue(item) {
+    if (!item || item.generation_epoch < this.currentEpoch) return false;
+    if (item.generation_epoch > this.currentEpoch) this.setEpoch(item.generation_epoch);
+    this.pending.push(item);
+    return true;
+  }
+
+  markActive(responseId, epoch, segmentId) {
+    const index = this.pending.findIndex((item) => identityMatches(item, responseId, epoch, segmentId));
+    if (index < 0) return false;
+    this.active.push(this.pending.splice(index, 1)[0]);
+    return true;
+  }
+
+  pauseResponse(responseId) {
+    const matches = (item) => item.response_id === responseId;
+    const paused = [...this.pending.filter(matches), ...this.active.filter(matches)];
+    this.pending = this.pending.filter((item) => !matches(item));
+    this.active = this.active.filter((item) => !matches(item));
+    this.paused.push(...paused);
+    return paused;
+  }
+
+  stopResponse(responseId) {
+    const matches = (item) => item.response_id === responseId;
+    const stopped = [...this.pending.filter(matches), ...this.active.filter(matches), ...this.paused.filter(matches)];
+    this.pending = this.pending.filter((item) => !matches(item));
+    this.active = this.active.filter((item) => !matches(item));
+    this.paused = this.paused.filter((item) => !matches(item));
+    return stopped;
+  }
+
+  complete(responseId, epoch, segmentId) {
+    const matches = (item) => identityMatches(item, responseId, epoch, segmentId);
+    this.pending = this.pending.filter((item) => !matches(item));
+    this.active = this.active.filter((item) => !matches(item));
+    this.paused = this.paused.filter((item) => !matches(item));
+  }
+
+  clear() {
+    this.pending = [];
+    this.active = [];
+    this.paused = [];
+  }
+}
+
+export class BrowserPlaybackCoordinator {
+  constructor({
+    context = null,
+    workletNode = null,
+    gainNode = null,
+    onPlaybackAck = () => {},
+    duckLevel = 0.25,
+    duckRampSeconds = 0.1,
+  } = {}) {
+    this.context = context;
+    this.workletNode = workletNode;
+    this.gainNode = gainNode;
+    this.queue = new PlaybackQueue();
+    this.onPlaybackAck = onPlaybackAck;
+    this.duckLevel = duckLevel;
+    this.duckRampSeconds = Math.min(duckRampSeconds, 0.1);
+    this.nextLegacySegmentId = 0;
+    this.#attachWorklet();
   }
 
   async unlock() {
     this.context ||= new AudioContext();
     if (this.context.state === "suspended") await this.context.resume();
+    if (!this.workletNode) {
+      await this.context.audioWorklet.addModule(new URL("./playback-worklet.js", import.meta.url));
+      this.gainNode = this.context.createGain();
+      this.gainNode.gain.value = 1;
+      this.workletNode = new AudioWorkletNode(this.context, "pcm-playback-processor");
+      this.workletNode.connect(this.gainNode);
+      this.gainNode.connect(this.context.destination);
+      this.#attachWorklet();
+    }
+    this.#flushPending();
+  }
+
+  enqueue(payload) {
+    const item = this.#normaliseItem(payload);
+    if (!item || !this.queue.enqueue(item)) return false;
+    if (this.workletNode) this.#sendItem(item);
+    return true;
+  }
+
+  setEpoch(epoch) {
+    if (!this.queue.setEpoch(epoch)) return false;
+    this.workletNode?.port.postMessage({ type: "set_epoch", generation_epoch: epoch });
+    return true;
+  }
+
+  duck() { this.#rampGain(this.duckLevel); }
+  restore() { this.#rampGain(1); }
+
+  pauseResponse(responseId) {
+    const paused = this.queue.pauseResponse(responseId);
+    if (paused.length) this.workletNode?.port.postMessage({ type: "pause_response", response_id: responseId });
+    return paused.length > 0;
+  }
+
+  stopResponse(responseId) {
+    const stopped = this.queue.stopResponse(responseId);
+    if (stopped.length) this.workletNode?.port.postMessage({ type: "stop_response", response_id: responseId });
+    return stopped.length > 0;
+  }
+
+  async close() {
+    this.queue.clear();
+    this.workletNode?.port.postMessage({ type: "stop_all" });
+    this.workletNode?.disconnect?.();
+    this.gainNode?.disconnect?.();
+    const context = this.context;
+    this.context = null;
+    this.workletNode = null;
+    this.gainNode = null;
+    await context?.close?.();
+  }
+
+  #normaliseItem(payload) {
+    const pcm16 = asInt16(payload?.pcm16 ?? payload?.audio_data);
+    if (!pcm16 || payload?.channels && payload.channels !== 1) return null;
+    const generation_epoch = Number.isInteger(payload?.generation_epoch ?? payload?.epoch)
+      ? (payload.generation_epoch ?? payload.epoch) : 0;
+    const segment_id = Number.isInteger(payload?.segment_id ?? payload?.segmentId)
+      ? (payload.segment_id ?? payload.segmentId) : this.nextLegacySegmentId++;
+    return {
+      response_id: payload?.response_id ?? payload?.responseId ?? "legacy-response",
+      generation_epoch,
+      segment_id,
+      pcm16,
+      sample_rate: payload?.sample_rate ?? payload?.sampleRate ?? 24000,
+      channels: 1,
+    };
+  }
+
+  #attachWorklet() {
+    if (!this.workletNode) return;
+    this.workletNode.port.onmessage = ({ data }) => this.#handleWorkletEvent(data);
+    this.workletNode.port.postMessage({ type: "set_epoch", generation_epoch: this.queue.currentEpoch });
+  }
+
+  #flushPending() {
+    for (const item of [...this.queue.pending]) this.#sendItem(item);
+  }
+
+  #sendItem(item) {
+    if (!this.queue.markActive(item.response_id, item.generation_epoch, item.segment_id)) return;
+    this.workletNode.port.postMessage({
+      type: "enqueue",
+      item: { ...item, pcm16: item.pcm16.buffer },
+    }, [item.pcm16.buffer]);
+  }
+
+  #handleWorkletEvent(event) {
+    if (!event || event.generation_epoch < this.queue.currentEpoch) return;
+    if (!["progress", "completed", "stopped", "paused"].includes(event.type)) return;
+    const acknowledgement = {
+      response_id: event.response_id,
+      generation_epoch: event.generation_epoch,
+      segment_id: event.segment_id,
+      sample_offset: Math.floor(event.sample_offset),
+      audio_time: event.audio_time,
+    };
+    this.onPlaybackAck(acknowledgement);
+    if (["completed", "stopped", "paused"].includes(event.type)) {
+      this.queue.complete(event.response_id, event.generation_epoch, event.segment_id);
+    }
+  }
+
+  #rampGain(target) {
+    const gain = this.gainNode?.gain;
+    if (!gain) return;
+    const now = this.context?.currentTime ?? 0;
+    gain.cancelScheduledValues(now);
+    gain.setValueAtTime(gain.value, now);
+    gain.linearRampToValueAtTime(target, now + this.duckRampSeconds);
+  }
+}
+
+export class BrowserAudioOutput {
+  constructor() {
+    this.coordinator = new BrowserPlaybackCoordinator();
+    this.segmentId = 0;
+  }
+
+  async unlock() {
+    await this.coordinator.unlock();
   }
 
   async playBase64(audioData, sampleRate = 24000) {
-    if (!audioData) return;
-    this.context ||= new AudioContext();
-    if (this.context.state === "suspended") await this.context.resume();
-    const binary = atob(audioData);
-    const pcm = new Int16Array(binary.length / 2);
-    for (let index = 0; index < pcm.length; index += 1) {
-      const low = binary.charCodeAt(index * 2);
-      const high = binary.charCodeAt(index * 2 + 1);
-      const value = (high << 8) | low;
-      pcm[index] = value & 0x8000 ? value - 0x10000 : value;
-    }
-    const buffer = this.context.createBuffer(1, pcm.length, sampleRate);
-    const channel = buffer.getChannelData(0);
-    for (let index = 0; index < pcm.length; index += 1) channel[index] = pcm[index] / 32768;
-    const source = this.context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(this.context.destination);
-    this.nextStart = Math.max(this.nextStart, this.context.currentTime);
-    source.start(this.nextStart);
-    this.nextStart += buffer.duration;
+    await this.unlock();
+    this.coordinator.enqueue({
+      response_id: "legacy-response",
+      generation_epoch: 0,
+      segment_id: this.segmentId++,
+      audio_data: audioData,
+      sample_rate: sampleRate,
+      channels: 1,
+    });
   }
 
   stop() {
-    this.nextStart = 0;
-    this.context?.close();
-    this.context = null;
+    return this.coordinator.close();
   }
 }

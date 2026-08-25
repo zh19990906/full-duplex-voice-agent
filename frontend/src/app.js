@@ -1,6 +1,6 @@
 import { appConfig } from "../config.js";
 import { createApiClient } from "./api.js";
-import { PcmMicrophoneInput, BrowserAudioOutput } from "./audio.js";
+import { PcmMicrophoneInput, BrowserPlaybackCoordinator } from "./audio.js";
 import { EventTimeline } from "./timeline.js";
 import { AgentWebSocket, EVENT_TYPES } from "./websocket.js";
 
@@ -37,12 +37,17 @@ export class StreamingAssistantMessage {
 
 export function bootResearchConsole(
   documentRef = document,
-  { microphoneFactory = (options) => new PcmMicrophoneInput(options) } = {},
+  {
+    microphoneFactory = (options) => new PcmMicrophoneInput(options),
+    playbackFactory = (options) => new BrowserPlaybackCoordinator(options),
+  } = {},
 ) {
   const api = createApiClient(appConfig);
   const timeline = new EventTimeline(byId("timeline"));
-  const audioOutput = new BrowserAudioOutput();
   const state = { sessionId: null, socket: null, microphone: null, microphoneAction: Promise.resolve() };
+  const playback = playbackFactory({
+    onPlaybackAck: (acknowledgement) => state.socket?.sendPlaybackAck(acknowledgement),
+  });
 
   const setStatus = (text) => { byId("session-status").textContent = text; };
   const queueMicrophoneAction = (action) => {
@@ -63,6 +68,14 @@ export function bootResearchConsole(
     return item;
   };
   const assistantMessage = new StreamingAssistantMessage(appendChat);
+  const eventField = (envelope, field, fallback = undefined) => {
+    const camelField = field.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+    for (const source of [envelope, envelope?.envelope, envelope?.payload]) {
+      if (source?.[field] !== undefined) return source[field];
+      if (source?.[camelField] !== undefined) return source[camelField];
+    }
+    return fallback;
+  };
 
   const connect = (sessionId) => {
     state.socket = new AgentWebSocket(appConfig.websocket);
@@ -71,10 +84,19 @@ export function bootResearchConsole(
       timeline.add(envelope);
       if (type === "token") assistantMessage.append(envelope.payload?.text || "");
       if (type === "transcript") appendChat(type, envelope.payload?.text || "");
-      if (type === "audio") audioOutput.playBase64(
-        envelope.payload?.audio_data,
-        envelope.payload?.sample_rate || 24000,
-      ).catch(console.error);
+      if (type === "audio") playback.enqueue({
+        response_id: eventField(envelope, "response_id"),
+        generation_epoch: eventField(envelope, "generation_epoch", 0),
+        segment_id: eventField(envelope, "segment_id"),
+        audio_data: eventField(envelope, "audio_data"),
+        sample_rate: eventField(envelope, "sample_rate", 24000),
+        channels: eventField(envelope, "channels", 1),
+      });
+      if (type === "duck") playback.duck();
+      if (type === "restore") playback.restore();
+      if (type === "pause_response") playback.pauseResponse(eventField(envelope, "response_id"));
+      if (type === "stop_response") playback.stopResponse(eventField(envelope, "response_id"));
+      if (type === "set_epoch") playback.setEpoch(eventField(envelope, "generation_epoch", 0));
       if (type === "agent_state") byId("agent-state").textContent = JSON.stringify(envelope.payload, null, 2);
       if (type === "tool_call" || type === "tool_result") byId("tool-output").textContent = JSON.stringify(envelope.payload, null, 2);
     }));
@@ -82,7 +104,7 @@ export function bootResearchConsole(
   };
 
   byId("create-session").addEventListener("click", async () => {
-    await audioOutput.unlock();
+    await playback.unlock();
     const session = await api.createSession();
     state.sessionId = session.session_id;
     byId("session-id").textContent = state.sessionId;
@@ -95,14 +117,15 @@ export function bootResearchConsole(
     await queueMicrophoneAction(stopActiveMicrophone);
     await api.deleteSession(state.sessionId);
     state.socket?.close();
-    audioOutput.stop();
+    state.socket = null;
+    await playback.close();
     setStatus("closed");
     state.sessionId = null;
   });
 
   byId("message-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    await audioOutput.unlock();
+    await playback.unlock();
     if (!state.sessionId) return setStatus("请先创建会话");
     const input = byId("message");
     const message = input.value.trim();
@@ -134,7 +157,7 @@ export function bootResearchConsole(
   });
   byId("stop-mic").addEventListener("click", () => queueMicrophoneAction(stopActiveMicrophone));
 
-  return { state, api, timeline };
+  return { state, api, timeline, playback };
 }
 
 if (typeof document !== "undefined") bootResearchConsole();

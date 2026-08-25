@@ -5,9 +5,17 @@ export const EVENT_TYPES = Object.freeze([
   "tool_call",
   "tool_result",
   "agent_state",
+  "duck",
+  "restore",
+  "pause_response",
+  "stop_response",
+  "set_epoch",
 ]);
 
-const normalizeEventName = (name) => (name === "audio_chunk" ? "audio" : name);
+const normalizeEventName = (name) => {
+  const normalized = String(name || "message").toLowerCase();
+  return normalized === "audio_chunk" ? "audio" : normalized;
+};
 
 export class AgentWebSocket extends EventTarget {
   constructor(url) {
@@ -31,15 +39,37 @@ export class AgentWebSocket extends EventTarget {
   }
 
   sendText(text) {
-    this.socket?.send(JSON.stringify({ type: "text", text }));
+    return this.#sendJson({ type: "text", text });
   }
 
   sendAudio(frame) {
     this.socket?.send(frame);
   }
 
+  sendPlaybackAck(payload) {
+    const acknowledgement = {
+      response_id: payload.response_id,
+      generation_epoch: payload.generation_epoch,
+      segment_id: payload.segment_id,
+      sample_offset: payload.sample_offset,
+      audio_time: payload.audio_time,
+    };
+    return this.#sendJson({ type: "playback_ack", payload: acknowledgement });
+  }
+
+  sendPlaybackControl(type, payload = {}) {
+    return this.#sendJson({ type, payload });
+  }
+
   close() {
     this.socket?.close();
     this.socket = null;
+  }
+
+  #sendJson(message) {
+    const openState = typeof WebSocket === "undefined" ? 1 : WebSocket.OPEN;
+    if (!this.socket || this.socket.readyState !== openState) return false;
+    this.socket.send(JSON.stringify(message));
+    return true;
   }
 }
