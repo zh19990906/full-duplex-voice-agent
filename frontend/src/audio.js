@@ -34,6 +34,7 @@ export class BrowserAudioOutput {
   async playBase64(audioData, sampleRate = 24000) {
     if (!audioData) return;
     this.context ||= new AudioContext();
+    if (this.context.state === "suspended") await this.context.resume();
     const binary = atob(audioData);
     const pcm = new Int16Array(binary.length / 2);
     for (let index = 0; index < pcm.length; index += 1) {

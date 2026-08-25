@@ -101,12 +101,16 @@ def build_app(args: argparse.Namespace):
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
+        await websocket.accept()
         session_id = websocket.query_params.get("session_id")
         session = sessions.get(session_id or "")
         if session is None:
+            await websocket.send_json({
+                "event": "error",
+                "payload": {"message": "unknown session"},
+            })
             await websocket.close(code=1008, reason="unknown session")
             return
-        await websocket.accept()
         session.sockets.add(websocket)
         try:
             while True:

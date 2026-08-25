@@ -48,6 +48,7 @@ class WebUiTests(unittest.TestCase):
         self.assertIn("AudioContext", audio)
         self.assertIn("Int16Array", audio)
         self.assertIn("createBuffer", audio)
+        self.assertIn("context.resume", audio)
 
     def test_frontend_has_no_backend_imports_or_framework_dependencies(self):
         source = "\n".join(path.read_text(encoding="utf-8") for path in FRONTEND.rglob("*.js"))
