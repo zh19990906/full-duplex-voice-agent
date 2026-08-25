@@ -69,6 +69,7 @@ class SpeechEventFusion:
         self.assistant_context = dict(assistant_context or {})
         self.latest_transcript: TranscriptChunk | None = None
         self._turn_open = False
+        self._turn_inactive = False
         self._activity_active = False
         self._speech_latched = False
         self._turn_end_latched = False
@@ -83,11 +84,12 @@ class SpeechEventFusion:
             raise TypeError("activity candidate must be AudioActivityCandidate")
         if not candidate.active:
             self._activity_active = False
+            self._mark_turn_inactive()
             return ()
         if self._activity_active:
             return ()
         self._activity_active = True
-        self._open_turn()
+        self._start_speech_turn()
         self._speech_latched = True
         self._turn_end_latched = False
         self._turn_end_count = 0
@@ -145,7 +147,7 @@ class SpeechEventFusion:
             self._turn_end_count = 0
             self._turn_end_latched = False
             if self._speaking_count >= self.speaking_frames and not self._speech_latched:
-                self._open_turn()
+                self._start_speech_turn()
                 self._speech_latched = True
                 return (self._turn_event("USER_SPEECH_START_CANDIDATE", candidate),)
             return ()
@@ -155,6 +157,7 @@ class SpeechEventFusion:
             self._turn_end_count = 0
             if self._idle_count >= self.idle_frames:
                 self._speech_latched = False
+                self._mark_turn_inactive()
             return ()
         if label == "turn_end":
             self._turn_end_count += 1
@@ -171,6 +174,10 @@ class SpeechEventFusion:
             self._idle_count = 0
             self._turn_end_count = 0
             if candidate.confidence >= self.backchannel_confidence:
+                if self._turn_inactive:
+                    self._open_new_turn()
+                else:
+                    self._open_turn()
                 return (self._turn_event("USER_BACKCHANNEL_CANDIDATE", candidate),)
             return ()
         raise ValueError(f"unsupported fusion turn label: {label!r}")
@@ -178,14 +185,35 @@ class SpeechEventFusion:
     def reset_turn(self) -> None:
         """Discard current-turn transcript evidence without a semantic action."""
         self._close_turn()
+        self._activity_active = False
+        self._turn_end_latched = False
+        self._speaking_count = 0
+        self._idle_count = 0
+        self._turn_end_count = 0
 
     def _open_turn(self) -> None:
         if not self._turn_open:
-            self._turn_open = True
-            self.latest_transcript = None
+            self._open_new_turn()
+
+    def _open_new_turn(self) -> None:
+        self._turn_open = True
+        self._turn_inactive = False
+        self.latest_transcript = None
+
+    def _start_speech_turn(self) -> None:
+        if self._turn_inactive:
+            self._open_new_turn()
+        else:
+            self._open_turn()
+
+    def _mark_turn_inactive(self) -> None:
+        if self._turn_open:
+            self._turn_inactive = True
+            self._speech_latched = False
 
     def _close_turn(self) -> None:
         self._turn_open = False
+        self._turn_inactive = False
         self.latest_transcript = None
         self._speech_latched = False
 

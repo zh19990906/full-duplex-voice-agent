@@ -105,6 +105,76 @@ class SpeechEventFusionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     SpeechEventFusion(backchannel_confidence=value)
 
+    def test_idle_keeps_pending_text_for_turn_end_then_new_speech_starts_fresh_evidence(self):
+        """Catches an idle scope leaking its pending transcript into new speech."""
+        fusion = SpeechEventFusion(idle_frames=1, turn_end_frames=2)
+        old = TranscriptChunk("asr-old", "旧话轮", 1.0, False, revision_id=1)
+        fusion.accept_transcript(old)
+        fusion.accept_turn(TurnCandidate("idle", 0.9))
+
+        self.assertEqual(fusion.accept_turn(TurnCandidate("turn_end", 0.9)), ())
+        ended = fusion.accept_turn(TurnCandidate("turn_end", 0.9))
+        self.assertEqual(ended[0].payload["transcript_evidence"], old.to_dict())
+
+        fresh = SpeechEventFusion(idle_frames=1, turn_end_frames=2)
+        fresh.accept_transcript(old)
+        fresh.accept_turn(TurnCandidate("idle", 0.9))
+        new_speech = fresh.accept_activity(AudioActivityCandidate(2, 1.2, True, 600.0))
+        self.assertEqual([event.event for event in new_speech], ["USER_SPEECH_START_CANDIDATE"])
+        self.assertIsNone(fresh.latest_transcript)
+
+    def test_activity_inactive_retains_pending_asr_for_turn_end_but_backchannel_opens_empty_scope(self):
+        """Catches activity=False either erasing pending ASR or reusing it for a new backchannel."""
+        fusion = SpeechEventFusion(turn_end_frames=2)
+        old = TranscriptChunk("asr-old", "待结束", 2.0, False, revision_id=2)
+        fusion.accept_activity(AudioActivityCandidate(1, 2.01, True, 700.0))
+        fusion.accept_transcript(old)
+        fusion.accept_activity(AudioActivityCandidate(2, 2.02, False, 0.0))
+
+        self.assertEqual(fusion.accept_turn(TurnCandidate("turn_end", 0.9)), ())
+        ended = fusion.accept_turn(TurnCandidate("turn_end", 0.9))
+        self.assertEqual(ended[0].payload["transcript_evidence"], old.to_dict())
+
+        # Recreate inactivity without closing, then ensure a new acoustic-only
+        # backchannel has no inherited transcript evidence.
+        fusion.accept_activity(AudioActivityCandidate(3, 3.0, True, 700.0))
+        fusion.accept_transcript(TranscriptChunk("asr-next", "待替换", 3.01, False, revision_id=3))
+        fusion.accept_activity(AudioActivityCandidate(4, 3.02, False, 0.0))
+        backchannel = fusion.accept_turn(TurnCandidate("backchannel", 0.9))
+        self.assertIsNone(backchannel[0].payload["transcript_evidence"])
+
+    def test_asr_update_while_inactive_stays_pending_until_turn_end_without_duplicate_speech_start(self):
+        """Catches inactive ASR updates being discarded or a stable active level re-emitting start."""
+        fusion = SpeechEventFusion(idle_frames=1, turn_end_frames=2)
+        first = AudioActivityCandidate(1, 4.0, True, 700.0)
+        self.assertEqual(
+            [event.event for event in fusion.accept_activity(first)],
+            ["USER_SPEECH_START_CANDIDATE"],
+        )
+        self.assertEqual(fusion.accept_activity(first), ())
+        fusion.accept_turn(TurnCandidate("idle", 0.9))
+        update = TranscriptChunk("asr-update", "静音后补全", 4.1, True, revision_id=4)
+        fusion.accept_transcript(update)
+
+        self.assertEqual(fusion.accept_turn(TurnCandidate("turn_end", 0.9)), ())
+        ended = fusion.accept_turn(TurnCandidate("turn_end", 0.9))
+        self.assertEqual(ended[0].payload["transcript_evidence"], update.to_dict())
+        self.assertEqual(fusion.accept_activity(first), ())
+
+    def test_reset_turn_clears_inactive_evidence_activity_and_hysteresis(self):
+        """Catches reset leaving old evidence or an active/latching flag behind."""
+        fusion = SpeechEventFusion(idle_frames=1, turn_end_frames=2)
+        fusion.accept_activity(AudioActivityCandidate(1, 5.0, True, 700.0))
+        fusion.accept_transcript(TranscriptChunk("asr-old", "旧文本", 5.1, False, revision_id=5))
+        fusion.accept_turn(TurnCandidate("idle", 0.9))
+
+        fusion.reset_turn()
+        restarted = fusion.accept_activity(AudioActivityCandidate(2, 5.2, True, 700.0))
+
+        self.assertEqual([event.event for event in restarted], ["USER_SPEECH_START_CANDIDATE"])
+        self.assertIsNone(fusion.latest_transcript)
+        self.assertEqual(fusion.accept_turn(TurnCandidate("turn_end", 0.9)), ())
+
     def test_final_revision_and_context_remain_candidates_without_mutating_session_state(self):
         """Catches fusion changing policy state or emitting legacy semantic User* events."""
         state = SessionState(floor=FloorState.ASSISTANT, response=ResponseState.PLAYING)
