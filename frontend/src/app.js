@@ -6,6 +6,35 @@ import { AgentWebSocket, EVENT_TYPES } from "./websocket.js";
 
 const byId = (id) => document.getElementById(id);
 
+export class StreamingAssistantMessage {
+  constructor(createMessage) {
+    this.createMessage = createMessage;
+    this.item = null;
+    this.text = "";
+  }
+
+  begin() {
+    this.item = null;
+    this.text = "";
+  }
+
+  append(chunk) {
+    if (!chunk) return;
+    this.item ||= this.createMessage("assistant", "");
+    this.text += chunk;
+    this.item.textContent = this.text;
+  }
+
+  finalize(text) {
+    if (text) {
+      this.item ||= this.createMessage("assistant", "");
+      this.item.textContent = text;
+    }
+    this.item = null;
+    this.text = "";
+  }
+}
+
 export function bootResearchConsole(documentRef = document) {
   const api = createApiClient(appConfig);
   const timeline = new EventTimeline(byId("timeline"));
@@ -18,14 +47,17 @@ export function bootResearchConsole(documentRef = document) {
     item.className = `chat-message ${role}`;
     item.textContent = text;
     byId("messages").append(item);
+    return item;
   };
+  const assistantMessage = new StreamingAssistantMessage(appendChat);
 
   const connect = (sessionId) => {
     state.socket = new AgentWebSocket(appConfig.websocket);
     EVENT_TYPES.forEach((type) => state.socket.addEventListener(type, (event) => {
       const envelope = event.detail;
       timeline.add(envelope);
-      if (type === "token" || type === "transcript") appendChat(type, envelope.payload?.text || "");
+      if (type === "token") assistantMessage.append(envelope.payload?.text || "");
+      if (type === "transcript") appendChat(type, envelope.payload?.text || "");
       if (type === "audio") audioOutput.playBase64(
         envelope.payload?.audio_data,
         envelope.payload?.sample_rate || 24000,
@@ -64,8 +96,9 @@ export function bootResearchConsole(documentRef = document) {
     if (!message) return;
     appendChat("user", message);
     input.value = "";
+    assistantMessage.begin();
     const response = await api.sendMessage(state.sessionId, message);
-    if (response.response) appendChat("assistant", response.response);
+    assistantMessage.finalize(response.response);
   });
 
   byId("start-mic").addEventListener("click", async () => {
