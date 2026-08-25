@@ -8,6 +8,8 @@ from typing import Any
 PROTOCOL_VERSION = 1
 PCM16_SAMPLE_RATE = 16000
 PCM16_MONO_CHANNELS = 1
+PCM16_FRAME_SAMPLES = 320
+PCM16_FRAME_BYTES = PCM16_FRAME_SAMPLES * 2
 
 # Network byte order: protocol version, sequence, capture timestamp,
 # sample rate, and channel count.
@@ -27,6 +29,7 @@ class RealtimeEnvelope:
     response_id: str | None
     generation_epoch: int
     payload: dict[str, Any]
+    segment_id: str | None = None
     protocol_version: int = PROTOCOL_VERSION
 
     def __post_init__(self) -> None:
@@ -45,6 +48,7 @@ class RealtimeEnvelope:
             "server_timestamp": self.server_timestamp,
             "response_id": self.response_id,
             "generation_epoch": self.generation_epoch,
+            "segment_id": self.segment_id,
             "payload": dict(self.payload),
         }
 
@@ -95,3 +99,5 @@ def _validate_audio_contract(header: AudioFrameHeader, pcm: bytes) -> None:
         raise ValueError(f"unsupported channel count: {header.channels}")
     if len(pcm) % 2:
         raise ValueError("PCM16 payload must contain whole samples")
+    if len(pcm) != PCM16_FRAME_BYTES:
+        raise ValueError(f"PCM16 payload must be exactly {PCM16_FRAME_BYTES} bytes")
