@@ -104,7 +104,12 @@ def build_app(args: argparse.Namespace):
         return {"session_id": session_id, "response": response}
 
     async def handle_websocket(websocket: WebSocket, session_id: str | None = None):
+        print(
+            f"REAL_WS_HANDLER_ENTERED path={websocket.url.path} session={session_id!r}",
+            flush=True,
+        )
         await websocket.accept()
+        print("REAL_WS_ACCEPTED", flush=True)
         session_id = session_id or websocket.query_params.get("session_id")
         session = sessions.get(session_id or "")
         if session is None:
