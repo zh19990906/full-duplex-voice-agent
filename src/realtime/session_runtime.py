@@ -42,6 +42,7 @@ class RealtimeSessionRuntime:
     async def close(self) -> None:
         """Close the ingress and make the session unavailable for more audio."""
         if self._closed:
+            await self.ingress.close()
             return
         self._closed = True
         await self.ingress.close()

@@ -94,6 +94,8 @@ class AudioIngress:
         self._queues: dict[str, asyncio.Queue[Any]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._consumers: dict[str, Callable[[Any], Awaitable[None] | None]] = {}
+        self._native_async_consumers: dict[str, bool] = {}
+        self._close_task: asyncio.Task[None] | None = None
 
         self._register_consumer("asr", asr_consumer, consumer_queue_size)
         self._register_consumer("turn", turn_consumer, consumer_queue_size)
@@ -160,28 +162,34 @@ class AudioIngress:
         self._raise_worker_error()
 
     async def close(self) -> None:
-        """Flush accepted work and stop all consumer workers cleanly."""
-        if self._closed:
-            return
+        """Atomically reject new frames, drain accepted work, and stop workers."""
+        async with self._lock:
+            if self._close_task is None:
+                # This transition happens before draining, so every frame either
+                # entered the ingress before close or is rejected by push().
+                self._closed = True
+                self._close_task = asyncio.create_task(
+                    self._close_impl(), name="audio-ingress-close"
+                )
+            close_task = self._close_task
 
+        await asyncio.shield(close_task)
+
+    async def _close_impl(self) -> None:
         try:
             await self.flush()
-        except AudioIngressConsumerError:
-            # The error has already been made observable by flush() and remains
-            # available through worker_errors. Closing must still release workers.
-            pass
+        finally:
+            async with self._lock:
+                worker_pairs = tuple(
+                    (self._queues[name], worker)
+                    for name, worker in self._workers.items()
+                    if not worker.done()
+                )
 
-        async with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            queues = tuple(self._queues.values())
-            workers = tuple(self._workers.values())
-
-        for queue in queues:
-            await queue.put(self._STOP)
-        if workers:
-            await asyncio.gather(*workers)
+            for queue, _ in worker_pairs:
+                await queue.put(self._STOP)
+            if worker_pairs:
+                await asyncio.gather(*(worker for _, worker in worker_pairs))
 
     def _register_consumer(
         self,
@@ -192,6 +200,7 @@ class AudioIngress:
         if consumer is None:
             return
         self._consumers[name] = consumer
+        self._native_async_consumers[name] = _is_native_async_callable(consumer)
         self._queues[name] = asyncio.Queue(maxsize=queue_size)
         self.metrics.consumer_overflow_frames[name] = 0
 
@@ -241,7 +250,10 @@ class AudioIngress:
             try:
                 if item is self._STOP:
                     return
-                result = consumer(item)
+                if self._native_async_consumers[name]:
+                    result = consumer(item)
+                else:
+                    result = await asyncio.to_thread(consumer, item)
                 if inspect.isawaitable(result):
                     await result
             except Exception as error:
@@ -265,3 +277,12 @@ def _pcm16_rms(pcm: bytes) -> float:
         total += sample * sample
         count += 1
     return math.sqrt(total / count) if count else 0.0
+
+
+def _is_native_async_callable(
+    consumer: Callable[[Any], Awaitable[None] | None],
+) -> bool:
+    """Return whether invoking ``consumer`` itself must stay on this event loop."""
+    return inspect.iscoroutinefunction(consumer) or inspect.iscoroutinefunction(
+        getattr(consumer, "__call__", None)
+    )
