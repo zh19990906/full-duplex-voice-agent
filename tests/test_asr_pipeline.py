@@ -20,6 +20,19 @@ class FakeASRAdapter(BaseASRAdapter):
         return None
 
 
+def _apply_event_revisions(events):
+    committed = ""
+    display = ""
+    for event in events:
+        payload = event.payload
+        if payload["replaces_committed"]:
+            committed = payload["committed_text"]
+        else:
+            committed += payload["text"]
+        display = committed + payload["unstable_text"]
+    return display
+
+
 class ASRPipelineTest(unittest.IsolatedAsyncioTestCase):
     async def test_session_creation_and_lifecycle(self):
         created = ASRSession("session-1", "zh", ASRSessionStatus.CREATED)
@@ -76,6 +89,73 @@ class ASRPipelineTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await pipeline.push_audio(b"ignored")
         self.assertEqual(adapter.audio_chunks, [])
+
+    async def test_revision_aware_partial_fields_cross_pipeline(self):
+        adapter = FakeASRAdapter([{
+            "chunk_id": "rolling-7",
+            "text": "北京",
+            "timestamp": 3.5,
+            "is_final": False,
+            "revision_id": 7,
+            "unstable_text": "旅游",
+        }])
+        pipeline = ASRPipeline(adapter)
+        await pipeline.start_session("session-1", "zh")
+
+        event = (await pipeline.push_audio(b"audio"))[0]
+
+        self.assertEqual(
+            event.payload,
+            {
+                "chunk_id": "rolling-7",
+                "text": "北京",
+                "is_final": False,
+                "session_id": "session-1",
+                "language": "zh",
+                "revision_id": 7,
+                "unstable_text": "旅游",
+                "committed_text": None,
+                "replaces_committed": False,
+            },
+        )
+
+    async def test_final_authoritative_replacements_cross_pipeline_exactly(self):
+        for old, replacement in (("old direction", "new request"), ("abcdef", "abc")):
+            with self.subTest(replacement=replacement):
+                adapter = FakeASRAdapter([[
+                    {
+                        "text": "",
+                        "is_final": False,
+                        "revision_id": 1,
+                        "unstable_text": old,
+                    },
+                    {
+                        "text": old,
+                        "is_final": False,
+                        "revision_id": 2,
+                        "unstable_text": " tail",
+                    },
+                    {
+                        "text": "",
+                        "is_final": True,
+                        "revision_id": 3,
+                        "committed_text": replacement,
+                        "replaces_committed": True,
+                    },
+                ]])
+                pipeline = ASRPipeline(adapter)
+                await pipeline.start_session("session-1", "en")
+
+                events = await pipeline.push_audio(b"audio")
+
+                self.assertIsInstance(events[-1], UserTurnEndEvent)
+                self.assertEqual(events[-1].payload["revision_id"], 3)
+                self.assertTrue(events[-1].payload["replaces_committed"])
+                self.assertEqual(_apply_event_revisions(events), replacement)
+
+    def test_mapping_normalization_validates_revision_fields(self):
+        with self.assertRaises(ValueError):
+            ASRPipeline._normalize_result({"text": "bad", "revision_id": -1})
 
 
 if __name__ == "__main__":

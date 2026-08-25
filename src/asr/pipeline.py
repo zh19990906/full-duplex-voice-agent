@@ -126,6 +126,10 @@ class ASRPipeline:
             "is_final": chunk.is_final,
             "session_id": session.session_id,
             "language": session.language,
+            "revision_id": chunk.revision_id,
+            "unstable_text": chunk.unstable_text,
+            "committed_text": chunk.committed_text,
+            "replaces_committed": chunk.replaces_committed,
         }
         event_type = UserTurnEndEvent if chunk.is_final else UserSpeechPartialEvent
         return event_type(
@@ -158,6 +162,10 @@ class ASRPipeline:
                     text=text,
                     timestamp=float(result.get("timestamp", time.time())),
                     is_final=bool(result.get("is_final", False)),
+                    revision_id=result.get("revision_id", 0),
+                    unstable_text=result.get("unstable_text", ""),
+                    committed_text=result.get("committed_text"),
+                    replaces_committed=result.get("replaces_committed", False),
                 ),
             )
         raise TypeError("ASR adapter result must be text, mapping, chunk, or None")

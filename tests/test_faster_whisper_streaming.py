@@ -8,6 +8,7 @@ import unittest
 
 from src.adapters.asr.providers.faster_whisper_streaming import (
     FasterWhisperStreamingProvider,
+    _stitch_shifted_hypothesis,
 )
 from src.asr.stream import TranscriptChunk
 from src.realtime.audio_ingress import RealtimeAudioFrame
@@ -279,11 +280,38 @@ class FasterWhisperStreamingProviderTests(unittest.IsolatedAsyncioTestCase):
             result = await provider.push_pcm(PCM)
             if result is not None:
                 chunks.append(result)
+        # The final decode follows an actual trim, so it may align its local
+        # window hypothesis with the preceding global transcript.
+        await provider.push_pcm(PCM)
         chunks.append(await provider.finalize_turn())
 
         self.assertFalse(chunks[-1].replaces_committed)
         self.assertEqual(_apply_revision(chunks), "abcdefgh")
         self.assertEqual("".join(chunk.text for chunk in chunks), "abcdefgh")
+
+    def test_shifted_alignment_prefers_latest_longest_anchor(self):
+        self.assertEqual(_stitch_shifted_hypothesis("abcd", "cdef"), "abcdef")
+        self.assertEqual(
+            _stitch_shifted_hypothesis("turn left at", "left on red"),
+            "turn left on red",
+        )
+        self.assertEqual(
+            _stitch_shifted_hypothesis("go left then left at", "left on red"),
+            "go left then left on red",
+        )
+        self.assertEqual(_stitch_shifted_hypothesis("alpha", "beta"), "beta")
+
+    async def test_unshifted_correction_does_not_use_window_stitching(self):
+        runtime = SyncRuntime(["turn left at", "turn right"])
+        provider = FasterWhisperStreamingProvider("model", runtime=runtime, cadence_ms=200)
+        for _ in range(10):
+            first = await provider.push_pcm(PCM)
+        for _ in range(10):
+            second = await provider.push_pcm(PCM)
+
+        self.assertEqual(first.unstable_text, "turn left at")
+        self.assertEqual(second.text, "turn ")
+        self.assertEqual(second.unstable_text, "right")
 
     async def test_lifetime_decode_metrics_include_source_and_end_to_end_rtf(self):
         provider = FasterWhisperStreamingProvider(

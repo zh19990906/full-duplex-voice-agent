@@ -61,7 +61,7 @@ class FasterWhisperStreamingProvider:
         self._bytes_since_decode = 0
         self._committer = StablePrefixCommitter()
         self._global_hypothesis = ""
-        self._rolling_window_shifted = False
+        self._trimmed_since_decode = False
         self._publication_sequence = 0
         self._cancelled = False
         self._turn_generation = 0
@@ -145,9 +145,10 @@ class FasterWhisperStreamingProvider:
             raise RuntimeError("faster-whisper ASR provider has been cancelled")
 
         window_hypothesis = result
+        trimmed_since_decode = self._trimmed_since_decode
         hypothesis = (
             _stitch_shifted_hypothesis(self._global_hypothesis, window_hypothesis)
-            if self._rolling_window_shifted
+            if trimmed_since_decode
             else window_hypothesis
         )
         self._global_hypothesis = hypothesis
@@ -164,6 +165,7 @@ class FasterWhisperStreamingProvider:
             committed_text = None
         publication_id = self._next_publication_id()
         self._bytes_since_decode = 0
+        self._trimmed_since_decode = False
         return TranscriptChunk(
             f"faster-whisper-{publication_id}",
             stable_delta,
@@ -204,7 +206,7 @@ class FasterWhisperStreamingProvider:
         self.source_audio_seconds += len(pcm) / (PCM16_SAMPLE_RATE * 2)
         if len(self._audio) > self._max_context_bytes:
             del self._audio[: len(self._audio) - self._max_context_bytes]
-            self._rolling_window_shifted = True
+            self._trimmed_since_decode = True
         self._bytes_since_decode += len(pcm)
 
     def _require_active(self) -> None:
@@ -216,7 +218,7 @@ class FasterWhisperStreamingProvider:
         self._bytes_since_decode = 0
         self._committer.reset()
         self._global_hypothesis = ""
-        self._rolling_window_shifted = False
+        self._trimmed_since_decode = False
 
     def _next_publication_id(self) -> int:
         self._publication_sequence += 1
@@ -273,13 +275,19 @@ async def _normalize_async_result(result: Any) -> str:
 
 
 def _stitch_shifted_hypothesis(previous: str, window: str) -> str:
-    """Map a rolling-window hypothesis onto the previous global hypothesis."""
+    """Map a shifted-window hypothesis onto a global transcript by anchoring.
+
+    The longest matching prefix of ``window`` is anchored at its latest
+    occurrence in ``previous``. If no prefix overlaps, the local window wins:
+    this yields no fabricated stable prefix and allows a later final chunk to
+    publish its authoritative replacement when needed.
+    """
     if not previous:
         return window
-    overlap_limit = min(len(previous), len(window))
-    for size in range(overlap_limit, 0, -1):
-        if previous.endswith(window[:size]):
-            return previous + window[size:]
+    for size in range(min(len(previous), len(window)), 0, -1):
+        anchor = previous.rfind(window[:size])
+        if anchor >= 0:
+            return previous[:anchor] + window
     return window
 
 
