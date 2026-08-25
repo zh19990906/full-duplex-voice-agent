@@ -5,7 +5,10 @@ from benchmarks.metrics import calculate_metrics
 from benchmarks.timeline import BenchmarkTimeline
 from src.adapters.tts.providers.cosyvoice import CosyVoiceTTSProvider
 from src.adapters.tts.providers.cosyvoice_worker import CosyVoiceWorkerClient
+from src.llm_runtime.stream import TokenChunk
 from src.model_runtime.factory import create_tts_adapter
+from src.realtime.text_segmenter import LanguageAwareTextSegmenter
+from src.runtime_app.real_session import RealModelSession
 from src.tts_runtime.stream import AudioChunk
 
 
@@ -40,7 +43,103 @@ class BlockingCosyVoiceRuntime(FakeCosyVoiceRuntime):
         return chunks()
 
 
+class FactoryWorkerRuntime:
+    """External worker boundary used to test the real factory wrapper stack."""
+
+    def __init__(self):
+        self.calls = []
+        self.cancelled = []
+        self.interrupted = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream_audio(self, text, **options):
+        self.calls.append((text, options))
+
+        async def chunks():
+            self.started.set()
+            await self.release.wait()
+            yield AudioChunk("late", b"late", 1.0, True)
+
+        return chunks()
+
+    async def cancel(self, request_id):
+        self.cancelled.append(request_id)
+
+    async def interrupt(self):
+        self.interrupted += 1
+
+
+class TwoTokenLLM:
+    async def stream_tokens(self, _prompt):
+        yield TokenChunk("one", "Hello", 1.0, False)
+        yield TokenChunk("two", " there", 2.0, True)
+
+    async def cancel(self):
+        return None
+
+
 class TTSProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_factory_worker_stack_forwards_identity_and_cancels_request(self):
+        """Breaks if factory wrappers drop per-call identity or cancel(request_id)."""
+
+        runtime = FactoryWorkerRuntime()
+        tts = create_tts_adapter(
+            {
+                "provider": "cosyvoice_worker",
+                "model_path": "models/tts",
+                "provider_instance": runtime,
+                "options": {"prompt_text": "configured prompt"},
+            }
+        )
+        session = RealModelSession(
+            TwoTokenLLM(),
+            tts,
+            lambda _value: None,
+            segmenter=LanguageAwareTextSegmenter(first_min_words=1, next_min_words=1),
+        )
+
+        running = asyncio.create_task(session.run("question"))
+        await asyncio.wait_for(runtime.started.wait(), timeout=0.5)
+        await session.interrupt()
+        runtime.release.set()
+        await asyncio.wait_for(running, timeout=0.5)
+
+        text, options = runtime.calls[0]
+        self.assertEqual(text, "Hello")
+        self.assertEqual(options["prompt_text"], "configured prompt")
+        self.assertEqual(options["segment_id"], 0)
+        self.assertEqual(options["response_id"], "response-1")
+        self.assertEqual(options["generation_epoch"], 1)
+        self.assertEqual(options["request_id"], "response-1:1:0")
+        self.assertEqual(runtime.cancelled, ["response-1:1:0"])
+
+    async def test_factory_worker_stack_resets_wrapped_provider_for_the_next_request(self):
+        """Breaks if backend reset leaves the wrapped provider interrupted."""
+
+        runtime = FactoryWorkerRuntime()
+        tts = create_tts_adapter(
+            {
+                "provider": "cosyvoice_worker",
+                "model_path": "models/tts",
+                "provider_instance": runtime,
+            }
+        )
+        session = RealModelSession(
+            TwoTokenLLM(),
+            tts,
+            lambda _value: None,
+            segmenter=LanguageAwareTextSegmenter(first_min_words=1, next_min_words=1),
+        )
+
+        first = asyncio.create_task(session.run("first"))
+        await asyncio.wait_for(runtime.started.wait(), timeout=0.5)
+        await session.interrupt()
+        runtime.release.set()
+        await asyncio.wait_for(first, timeout=0.5)
+
+        self.assertEqual(await asyncio.wait_for(session.run("second"), timeout=0.5), "Hello there")
+
     async def test_factory_creates_cosyvoice_provider(self):
         runtime = FakeCosyVoiceRuntime()
         adapter = create_tts_adapter(

@@ -47,11 +47,14 @@ class CosyVoiceTTSProvider:
             if inspect.isawaitable(result):
                 await result
 
-    async def stream_audio(self, text: str) -> AsyncIterable[AudioChunk]:
+    async def stream_audio(self, text: str, **options: Any) -> AsyncIterable[AudioChunk]:
+        """Stream audio while allowing realtime call identity to reach runtime."""
         if self._interrupted:
             raise RuntimeError("CosyVoice provider has been interrupted")
         method = self._runtime_method()
-        result = method(text, **self.options)
+        runtime_options = dict(self.options)
+        runtime_options.update(options)
+        result = self._call_supported(method, text, **runtime_options)
         if inspect.isawaitable(result):
             result = await result
 
@@ -69,12 +72,30 @@ class CosyVoiceTTSProvider:
         if method is None:
             method = getattr(self.runtime, "cancel", None)
         if callable(method):
-            result = method()
+            result = self._call_supported(method)
             if inspect.isawaitable(result):
                 await result
 
-    def reset(self) -> None:
+    async def cancel(self, request_id: str) -> None:
+        """Forward a request-scoped cancel when the wrapped runtime supports it."""
+
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("request_id must be a nonempty string")
+        self._interrupted = True
+        method = getattr(self.runtime, "cancel", None)
+        if method is None:
+            method = getattr(self.runtime, "interrupt", None)
+        if callable(method):
+            result = self._call_supported(method, request_id)
+            if inspect.isawaitable(result):
+                await result
+
+    def reset(self) -> Any:
         self._interrupted = False
+        method = getattr(self.runtime, "reset", None)
+        if callable(method):
+            return method()
+        return None
 
     def _runtime_method(self):
         for name in ("stream_audio", "synthesize_stream"):
@@ -82,6 +103,25 @@ class CosyVoiceTTSProvider:
             if callable(method):
                 return method
         raise RuntimeError("CosyVoice runtime must expose stream_audio() or synthesize_stream()")
+
+    @staticmethod
+    def _call_supported(method: Any, *args: Any, **kwargs: Any) -> Any:
+        """Retain compatibility with runtimes that do not know realtime keys."""
+
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return method(*args, **kwargs)
+        if any(parameter.kind is parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return method(*args, **kwargs)
+        positional_count = sum(
+            parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+            for parameter in signature.parameters.values()
+        )
+        return method(
+            *args[:positional_count],
+            **{key: value for key, value in kwargs.items() if key in signature.parameters},
+        )
 
     @staticmethod
     async def _iterate(result: Any) -> AsyncIterable[Any]:

@@ -265,6 +265,61 @@ class CosyVoiceWorkerCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await collect_with_timeout(stream), [])
         await client.close()
 
+    async def test_subprocess_transport_keeps_identity_and_discards_late_audio_after_cancel(self):
+        worker = "\n".join(
+            [
+                "import json, sys",
+                "print(json.dumps({'type': 'ready'}), flush=True)",
+                "request = json.loads(sys.stdin.readline())",
+                "print(json.dumps({'type': 'chunk', 'request_id': request['request_id'], 'audio_b64': 'cGNt', 'is_final': False}), flush=True)",
+                "cancel = json.loads(sys.stdin.readline())",
+                "assert cancel == {'op': 'cancel', 'request_id': request['request_id']}",
+                "print(json.dumps({'type': 'chunk', 'request_id': request['request_id'], 'audio_b64': 'bGF0ZQ==', 'is_final': False}), flush=True)",
+                "print(json.dumps({'type': 'cancelled', 'request_id': request['request_id']}), flush=True)",
+                "sys.stdin.readline()",
+            ]
+        )
+        client = CosyVoiceWorkerClient(
+            "/models/cosyvoice", worker_command=[sys.executable, "-u", "-c", worker]
+        )
+        stream = await client.stream_audio(
+            "文本",
+            request_id="request-7",
+            response_id="response-4",
+            generation_epoch=9,
+            segment_id=2,
+        )
+
+        first = await asyncio.wait_for(anext(stream), timeout=0.5)
+        await client.cancel("request-7")
+
+        self.assertEqual(first.audio_data, b"pcm")
+        self.assertEqual(
+            (first.request_id, first.response_id, first.generation_epoch, first.segment_id),
+            ("request-7", "response-4", 9, 2),
+        )
+        self.assertEqual(await collect_with_timeout(stream), [])
+        await client.close()
+
+    async def test_subprocess_eof_marks_transport_broken_after_request_start(self):
+        worker = "\n".join(
+            [
+                "import json, sys",
+                "print(json.dumps({'type': 'ready'}), flush=True)",
+                "sys.stdin.readline()",
+            ]
+        )
+        client = CosyVoiceWorkerClient(
+            "/models/cosyvoice", worker_command=[sys.executable, "-u", "-c", worker]
+        )
+        stream = await client.stream_audio("文本", request_id="request-7")
+
+        with self.assertRaisesRegex(RuntimeError, "protocol ended unexpectedly"):
+            await asyncio.wait_for(anext(stream), timeout=0.5)
+        with self.assertRaisesRegex(RuntimeError, "transport is broken"):
+            await client.stream_audio("下一次", request_id="request-8")
+        await client.close()
+
     async def test_client_propagates_every_identity_to_audio_chunks(self):
         transport = ScriptedWorkerTransport(
             messages=[
