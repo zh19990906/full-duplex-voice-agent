@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 import inspect
 import math
@@ -32,6 +32,17 @@ _LABEL_ALIASES = {
     "backchannel": "backchannel",
     "back_channel": "backchannel",
 }
+
+# A label-count mapping is a summary, not a time series. On equal counts we
+# retain speech evidence before idle, backchannel, or turn-end evidence:
+# speaking > noidle > idle > backchannel > turn_end.
+AGGREGATE_LABEL_PRIORITY = (
+    "speaking",
+    "noidle",
+    "idle",
+    "backchannel",
+    "turn_end",
+)
 
 
 @dataclass(frozen=True)
@@ -85,6 +96,63 @@ class TurnCandidate:
             "rtf": self.rtf,
             "metadata": dict(self.metadata),
         }
+
+
+@dataclass(frozen=True)
+class _NormalizedTurnLabel:
+    """One normalized label before provider-specific identity enrichment."""
+
+    label: str
+    confidence: float
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    capture_timestamp: float | None = None
+    sequence: int | None = None
+    revision_id: int | None = None
+
+
+def normalize_turn_candidates(
+    result: Any,
+    *,
+    capture_timestamp: float | None = None,
+    sequence: int | None = None,
+    revision_id: int | None = None,
+    inference_duration: float = 0.0,
+    rtf: float = 0.0,
+    next_revision_id: Callable[[], int] | None = None,
+) -> tuple[TurnCandidate, ...]:
+    """Normalize supported X2 wrapper output into data-only candidates.
+
+    Ordered frame lists retain their order. Label-count mappings intentionally
+    become exactly one aggregate candidate because their counts have no
+    temporal ordering information.
+    """
+    normalized = _normalize_turn_result(result)
+    candidates = []
+    for item in normalized:
+        candidate_revision = (
+            next_revision_id() if next_revision_id is not None else revision_id
+        )
+        candidates.append(
+            TurnCandidate(
+                item.label,
+                item.confidence,
+                capture_timestamp=(
+                    capture_timestamp
+                    if capture_timestamp is not None
+                    else item.capture_timestamp
+                ),
+                sequence=sequence if sequence is not None else item.sequence,
+                revision_id=(
+                    candidate_revision
+                    if candidate_revision is not None
+                    else item.revision_id
+                ),
+                inference_duration=inference_duration,
+                rtf=rtf,
+                metadata=item.metadata,
+            )
+        )
+    return tuple(candidates)
 
 
 class X2TurnRollingProvider:
@@ -191,20 +259,16 @@ class X2TurnRollingProvider:
         if self._cancelled or generation != self._generation:
             raise RuntimeError("X2-Turn provider has been cancelled")
 
-        candidates = tuple(
-            TurnCandidate(
-                label=label,
-                confidence=confidence,
-                capture_timestamp=(
-                    latest_frame.capture_timestamp if latest_frame is not None else None
-                ),
-                sequence=latest_frame.sequence if latest_frame is not None else None,
-                revision_id=self._next_publication_id(),
-                inference_duration=duration,
-                rtf=self.last_rtf,
-                metadata=metadata,
-            )
-            for label, confidence, metadata in result
+        candidates = await asyncio.to_thread(
+            normalize_turn_candidates,
+            result,
+            capture_timestamp=(
+                latest_frame.capture_timestamp if latest_frame is not None else None
+            ),
+            sequence=latest_frame.sequence if latest_frame is not None else None,
+            inference_duration=duration,
+            rtf=self.last_rtf,
+            next_revision_id=self._next_publication_id,
         )
         self._bytes_since_decode = 0
         return candidates
@@ -222,7 +286,7 @@ class X2TurnRollingProvider:
             async for item in result:
                 items.append(item)
             result = items
-        return await asyncio.to_thread(_normalize_turn_result, result)
+        return result
 
     def _runtime_method(self):
         if self.runtime is None:
@@ -297,7 +361,7 @@ def _validated_pcm(value: bytes | RealtimeAudioFrame) -> tuple[bytes, RealtimeAu
     return pcm, frame
 
 
-def _normalize_turn_result(result: Any) -> tuple[tuple[str, float, dict[str, Any]], ...]:
+def _normalize_turn_result(result: Any) -> tuple[_NormalizedTurnLabel, ...]:
     """Normalize official/test X2 wrapper result shapes without transcript use."""
     if result is None:
         return ()
@@ -305,7 +369,7 @@ def _normalize_turn_result(result: Any) -> tuple[tuple[str, float, dict[str, Any
         # The official wrapper can return ``(transcript, turn_frames)``.
         return _normalize_turn_result(result[1])
     if isinstance(result, str):
-        return ((_normalize_label(result), 1.0, {}),)
+        return (_NormalizedTurnLabel(_normalize_label(result), 1.0),)
     if isinstance(result, Mapping):
         if _label_value(result) is not None:
             return (_normalize_turn_item(result),)
@@ -327,32 +391,59 @@ def _normalize_turn_result(result: Any) -> tuple[tuple[str, float, dict[str, Any
     raise TypeError("X2-Turn result must expose turn labels")
 
 
-def _normalize_turn_collection(value: Any) -> tuple[tuple[str, float, dict[str, Any]], ...]:
+def _normalize_turn_collection(value: Any) -> tuple[_NormalizedTurnLabel, ...]:
     if isinstance(value, Mapping) and _label_value(value) is None:
-        normalized = []
+        counts: dict[str, int] = {}
         for label, count in value.items():
             if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                 raise TypeError("turn label counts must be nonnegative integers")
             if count:
-                normalized.append((_normalize_label(str(label)), 1.0, {"count": count}))
-        return tuple(normalized)
+                normalized_label = _normalize_label(str(label))
+                counts[normalized_label] = counts.get(normalized_label, 0) + count
+        if not counts:
+            return ()
+        dominant = max(
+            counts,
+            key=lambda label: (counts[label], -AGGREGATE_LABEL_PRIORITY.index(label)),
+        )
+        total = sum(counts.values())
+        return (
+            _NormalizedTurnLabel(
+                dominant,
+                counts[dominant] / total,
+                {"aggregated": True, "counts": dict(counts)},
+            ),
+        )
     return _normalize_turn_result(value)
 
 
-def _normalize_turn_item(item: Any) -> tuple[str, float, dict[str, Any]]:
+def _normalize_turn_item(item: Any) -> _NormalizedTurnLabel:
     if isinstance(item, Mapping):
         values = item
         label = _label_value(values)
         confidence = values.get("confidence", values.get("score", values.get("probability", 1.0)))
         count = values.get("count")
+        capture_timestamp = values.get("capture_timestamp", values.get("timestamp"))
+        sequence = values.get("sequence")
+        revision_id = values.get("revision_id")
     else:
         label = _label_value(item)
         confidence = getattr(item, "confidence", getattr(item, "score", 1.0))
         count = getattr(item, "count", None)
+        capture_timestamp = getattr(item, "capture_timestamp", getattr(item, "timestamp", None))
+        sequence = getattr(item, "sequence", None)
+        revision_id = getattr(item, "revision_id", None)
     if label is None:
         raise ValueError("X2-Turn label item must include a label")
     metadata = {"count": count} if count is not None else {}
-    return _normalize_label(label), _validated_confidence(confidence), metadata
+    return _NormalizedTurnLabel(
+        _normalize_label(label),
+        _validated_confidence(confidence),
+        metadata,
+        capture_timestamp,
+        sequence,
+        revision_id,
+    )
 
 
 def _label_value(item: Any) -> str | None:

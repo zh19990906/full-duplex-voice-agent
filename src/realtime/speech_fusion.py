@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import math
 import time
 from typing import Any
 
@@ -53,7 +54,12 @@ class SpeechEventFusion:
         }.items():
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if not isinstance(backchannel_confidence, (int, float)) or not 0 <= backchannel_confidence <= 1:
+        if (
+            isinstance(backchannel_confidence, bool)
+            or not isinstance(backchannel_confidence, (int, float))
+            or not math.isfinite(float(backchannel_confidence))
+            or not 0 <= backchannel_confidence <= 1
+        ):
             raise ValueError("backchannel_confidence must be between 0 and 1")
         self.speaking_frames = speaking_frames
         self.idle_frames = idle_frames
@@ -62,6 +68,7 @@ class SpeechEventFusion:
         self.session_state = session_state
         self.assistant_context = dict(assistant_context or {})
         self.latest_transcript: TranscriptChunk | None = None
+        self._turn_open = False
         self._activity_active = False
         self._speech_latched = False
         self._turn_end_latched = False
@@ -80,6 +87,7 @@ class SpeechEventFusion:
         if self._activity_active:
             return ()
         self._activity_active = True
+        self._open_turn()
         self._speech_latched = True
         self._turn_end_latched = False
         self._turn_end_count = 0
@@ -106,6 +114,7 @@ class SpeechEventFusion:
         """Store ASR evidence and publish it without deciding user intent."""
         if not isinstance(chunk, TranscriptChunk):
             raise TypeError("transcript chunk must be TranscriptChunk")
+        self._open_turn()
         self.latest_transcript = chunk
         name = "USER_TRANSCRIPT_FINAL_CANDIDATE" if chunk.is_final else "USER_TRANSCRIPT_PARTIAL_CANDIDATE"
         return (
@@ -136,6 +145,7 @@ class SpeechEventFusion:
             self._turn_end_count = 0
             self._turn_end_latched = False
             if self._speaking_count >= self.speaking_frames and not self._speech_latched:
+                self._open_turn()
                 self._speech_latched = True
                 return (self._turn_event("USER_SPEECH_START_CANDIDATE", candidate),)
             return ()
@@ -152,7 +162,9 @@ class SpeechEventFusion:
             self._idle_count = 0
             if self._turn_end_count >= self.turn_end_frames and not self._turn_end_latched:
                 self._turn_end_latched = True
-                return (self._turn_event("USER_TURN_END_CANDIDATE", candidate),)
+                event = self._turn_event("USER_TURN_END_CANDIDATE", candidate)
+                self._close_turn()
+                return (event,)
             return ()
         if label == "backchannel":
             self._speaking_count = 0
@@ -162,6 +174,20 @@ class SpeechEventFusion:
                 return (self._turn_event("USER_BACKCHANNEL_CANDIDATE", candidate),)
             return ()
         raise ValueError(f"unsupported fusion turn label: {label!r}")
+
+    def reset_turn(self) -> None:
+        """Discard current-turn transcript evidence without a semantic action."""
+        self._close_turn()
+
+    def _open_turn(self) -> None:
+        if not self._turn_open:
+            self._turn_open = True
+            self.latest_transcript = None
+
+    def _close_turn(self) -> None:
+        self._turn_open = False
+        self.latest_transcript = None
+        self._speech_latched = False
 
     def _turn_event(self, name: str, candidate: TurnCandidate) -> SpeechCandidateEvent:
         return self._event(

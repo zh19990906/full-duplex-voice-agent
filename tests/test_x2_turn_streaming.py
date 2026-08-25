@@ -10,6 +10,7 @@ from src.adapters.turn.x2_turn_adapter import X2TurnAdapter
 from src.adapters.turn.x2_turn_streaming import TurnCandidate, X2TurnRollingProvider
 from src.realtime.audio_ingress import RealtimeAudioFrame
 from src.realtime.protocol import AudioFrameHeader, PCM16_FRAME_BYTES
+from src.realtime.speech_fusion import SpeechEventFusion
 
 
 PCM = b"\x00\x00" * (PCM16_FRAME_BYTES // 2)
@@ -122,11 +123,43 @@ class X2TurnRollingProviderTests(unittest.IsolatedAsyncioTestCase):
         third = await self._push_cadence(provider)
 
         self.assertEqual([item.label for item in first], ["speaking", "turn_end"])
-        self.assertEqual([item.label for item in second], ["idle", "backchannel"])
-        self.assertEqual(second[0].metadata["count"], 2)
+        self.assertEqual([item.label for item in second], ["idle"])
+        self.assertEqual(second[0].confidence, 2 / 3)
+        self.assertEqual(second[0].metadata["counts"], {"idle": 2, "backchannel": 1})
+        self.assertTrue(second[0].metadata["aggregated"])
         self.assertEqual(third[0].label, "noidle")
         self.assertEqual(third[0].confidence, 0.6)
         self.assertNotIn("transcript", third[0].metadata)
+
+    async def test_label_counts_are_one_aggregate_window_not_a_fabricated_sequence(self):
+        """Catches count mappings inventing speaking-to-turn-end chronology."""
+        runtime = SequenceRuntime(
+            [
+                {"turn_labels": {"speaking": 3, "turn_end": 3}},
+                {"turn_labels": {"turn_end": 2}},
+                {"turn_labels": {"turn_end": 2}},
+            ]
+        )
+        provider = X2TurnRollingProvider("models/x2", runtime=runtime, cadence_ms=100)
+        fusion = SpeechEventFusion(turn_end_frames=2)
+
+        mixed = await self._push_cadence(provider)
+        self.assertEqual(len(mixed), 1)
+        self.assertEqual(mixed[0].label, "speaking")
+        self.assertEqual(mixed[0].confidence, 0.5)
+        self.assertEqual(mixed[0].metadata, {
+            "aggregated": True,
+            "counts": {"speaking": 3, "turn_end": 3},
+        })
+        mixed_events = fusion.accept_turn(mixed[0])
+        self.assertEqual([event.event for event in mixed_events], ["USER_SPEECH_START_CANDIDATE"])
+        self.assertNotIn("USER_TURN_END_CANDIDATE", [event.event for event in mixed_events])
+
+        self.assertEqual(fusion.accept_turn((await self._push_cadence(provider))[0]), ())
+        self.assertEqual(
+            [event.event for event in fusion.accept_turn((await self._push_cadence(provider))[0])],
+            ["USER_TURN_END_CANDIDATE"],
+        )
 
     async def test_sync_inference_and_lazy_result_normalization_do_not_block_event_loop(self):
         """Catches lazy official outputs being consumed on the realtime event loop."""
@@ -198,6 +231,29 @@ class X2TurnAdapterCandidateCompatibilityTests(unittest.TestCase):
         self.assertEqual(candidate.capture_timestamp, 3.5)
         self.assertEqual(legacy.event, "USER_TURN_END")
         self.assertEqual(adapter.emitted_events, [])
+
+    def test_plural_candidate_mapping_uses_official_wrapper_shapes(self):
+        """Catches the adapter accepting only a bespoke single-state mapping."""
+        adapter = X2TurnAdapter(backend=object())
+        first_frame = type("TurnFrame", (), {"label": "speaking", "score": 0.8})()
+        second_frame = type("TurnFrame", (), {"label": "turn-end", "confidence": 0.7})()
+        official_result = RuntimeResult("ASR is not authoritative here", [first_frame, second_frame])
+
+        object_candidates = adapter.map_candidates(official_result)
+        tuple_candidates = adapter.map_candidates(("ignored transcript", ["idle", "noidle"]))
+        count_candidates = adapter.map_candidates({"turn_labels": {"speaking": 2, "turn_end": 1}})
+
+        self.assertEqual([candidate.label for candidate in object_candidates], ["speaking", "turn_end"])
+        self.assertEqual([candidate.label for candidate in tuple_candidates], ["idle", "noidle"])
+        self.assertEqual(len(count_candidates), 1)
+        self.assertEqual(count_candidates[0].label, "speaking")
+        self.assertTrue(count_candidates[0].metadata["aggregated"])
+        with self.assertRaisesRegex(ValueError, "map_candidates"):
+            adapter.map_candidate(official_result)
+
+        single = adapter.map_candidate({"label": "idle", "timestamp": 2.5, "sequence": 7})
+        self.assertEqual(single.capture_timestamp, 2.5)
+        self.assertEqual(single.sequence, 7)
 
 
 class X2TurnBenchmarkScriptTests(unittest.TestCase):

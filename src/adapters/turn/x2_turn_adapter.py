@@ -16,7 +16,7 @@ from src.core.events.events import (
 from src.core.interfaces.turn import TurnAdapter
 
 from .config import X2TurnConfig
-from .x2_turn_streaming import TurnCandidate
+from .x2_turn_streaming import TurnCandidate, normalize_turn_candidates
 
 
 EventHandler = Callable[[BaseEvent], Awaitable[None] | None]
@@ -82,25 +82,18 @@ class X2TurnAdapter(TurnAdapter):
         )
 
     def map_candidate(self, output: Any) -> TurnCandidate:
-        """Map backend evidence for realtime fusion without emitting a User* event."""
-        state, payload, timestamp = self._normalize_output(output)
-        values = dict(output) if isinstance(output, Mapping) else {
-            name: getattr(output, name)
-            for name in ("sequence", "revision_id", "count")
-            if hasattr(output, name)
-        }
-        confidence = payload.get("confidence", 1.0)
-        metadata = {key: values[key] for key in ("count",) if key in values}
-        sequence = values.get("sequence")
-        revision_id = values.get("revision_id")
-        return TurnCandidate(
-            state,
-            confidence,
-            capture_timestamp=timestamp,
-            sequence=sequence,
-            revision_id=revision_id,
-            metadata=metadata,
-        )
+        """Map exactly one candidate; use :meth:`map_candidates` for many."""
+        candidates = self.map_candidates(output)
+        if len(candidates) != 1:
+            raise ValueError(
+                "X2-Turn output normalized to zero or multiple candidates; "
+                "use map_candidates()"
+            )
+        return candidates[0]
+
+    def map_candidates(self, output: Any) -> tuple[TurnCandidate, ...]:
+        """Map official X2 wrapper evidence without emitting a legacy User* event."""
+        return normalize_turn_candidates(output)
 
     def _call_backend(self, audio_chunk: bytes) -> Any:
         for method_name in ("process_audio", "push_audio", "infer"):
