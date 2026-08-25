@@ -32,6 +32,42 @@ const replaceGlobal = (name, value) => {
   };
 };
 
+const deferred = () => {
+  let resolve;
+  const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+};
+
+const waitFor = async (condition) => {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (condition()) return;
+    await Promise.resolve();
+  }
+  assert.fail("timed out waiting for deterministic microphone action");
+};
+
+const createConsoleDocument = () => {
+  const elements = new Map();
+  const element = () => ({
+    textContent: "",
+    value: "",
+    append: () => {},
+    prepend: () => {},
+    addEventListener(type, listener) { this.listeners ||= new Map(); this.listeners.set(type, listener); },
+    async trigger(type) { await this.listeners.get(type)({ preventDefault: () => {} }); },
+  });
+  for (const id of ["timeline", "session-status", "messages", "agent-state", "tool-output", "session-id", "create-session", "close-session", "message-form", "message", "start-mic", "stop-mic", "mic-status"]) {
+    elements.set(id, element());
+  }
+  return {
+    elements,
+    documentRef: {
+      getElementById: (id) => elements.get(id),
+      createElement: () => element(),
+    },
+  };
+};
+
 test("encoder holds partial samples and emits a complete V1 PCM16 frame", () => {
   const encoder = new PcmFrameEncoder();
   const partial = new Float32Array(319);
@@ -275,22 +311,7 @@ test("PcmMicrophoneInput clears every owned resource when recording-state notifi
 });
 
 test("a second Start click stops the active microphone before replacement", async () => {
-  const elements = new Map();
-  const element = () => ({
-    textContent: "",
-    value: "",
-    append: () => {},
-    prepend: () => {},
-    addEventListener(type, listener) { this.listeners ||= new Map(); this.listeners.set(type, listener); },
-    async trigger(type) { await this.listeners.get(type)({ preventDefault: () => {} }); },
-  });
-  for (const id of ["timeline", "session-status", "messages", "agent-state", "tool-output", "session-id", "create-session", "close-session", "message-form", "message", "start-mic", "stop-mic", "mic-status"]) {
-    elements.set(id, element());
-  }
-  const documentRef = {
-    getElementById: (id) => elements.get(id),
-    createElement: () => element(),
-  };
+  const { elements, documentRef } = createConsoleDocument();
   const restoreDocument = replaceGlobal("document", documentRef);
   const lifecycle = [];
   const microphones = ["first", "second"].map((name) => ({
@@ -309,6 +330,79 @@ test("a second Start click stops the active microphone before replacement", asyn
 
     assert.deepEqual(lifecycle, ["first-start", "first-stop", "second-start"]);
     assert.equal(state.microphone, second);
+  } finally {
+    restoreDocument();
+  }
+});
+
+test("queued Start then Stop shuts down the final microphone", async () => {
+  const { elements, documentRef } = createConsoleDocument();
+  const restoreDocument = replaceGlobal("document", documentRef);
+  const events = [];
+  const firstGate = deferred();
+  const secondGate = deferred();
+  const gates = [firstGate, secondGate];
+  const microphones = ["first", "second"].map((name, index) => ({
+    start: async () => {
+      events.push(`${name}-start`);
+      await gates[index].promise;
+      events.push(`${name}-ready`);
+    },
+    stop: async () => events.push(`${name}-stop`),
+  }));
+
+  try {
+    const { state } = bootResearchConsole(documentRef, { microphoneFactory: () => microphones.shift() });
+    state.socket = { sendAudio: () => {} };
+    const firstStart = elements.get("start-mic").trigger("click");
+    await waitFor(() => events.includes("first-start"));
+    const secondStart = elements.get("start-mic").trigger("click");
+    const stop = elements.get("stop-mic").trigger("click");
+    firstGate.resolve();
+    await waitFor(() => events.includes("second-start"));
+    secondGate.resolve();
+    await Promise.all([firstStart, secondStart, stop]);
+
+    assert.deepEqual(events, ["first-start", "first-ready", "first-stop", "second-start", "second-ready", "second-stop"]);
+    assert.equal(state.microphone, null);
+  } finally {
+    restoreDocument();
+  }
+});
+
+test("queued Start then Close shuts down the final microphone before session state clears", async () => {
+  const { elements, documentRef } = createConsoleDocument();
+  const restoreDocument = replaceGlobal("document", documentRef);
+  const events = [];
+  const firstGate = deferred();
+  const secondGate = deferred();
+  const gates = [firstGate, secondGate];
+  const microphones = ["first", "second"].map((name, index) => ({
+    start: async () => {
+      events.push(`${name}-start`);
+      await gates[index].promise;
+      events.push(`${name}-ready`);
+    },
+    stop: async () => events.push(`${name}-stop`),
+  }));
+
+  try {
+    const { state, api } = bootResearchConsole(documentRef, { microphoneFactory: () => microphones.shift() });
+    state.sessionId = "session-1";
+    state.socket = { close: () => events.push("socket-closed"), sendAudio: () => {} };
+    api.deleteSession = async () => events.push("session-deleted");
+    const firstStart = elements.get("start-mic").trigger("click");
+    await waitFor(() => events.includes("first-start"));
+    const secondStart = elements.get("start-mic").trigger("click");
+    const close = elements.get("close-session").trigger("click");
+    firstGate.resolve();
+    await waitFor(() => events.includes("second-start"));
+    secondGate.resolve();
+    await Promise.all([firstStart, secondStart, close]);
+
+    assert.deepEqual(events, ["first-start", "first-ready", "first-stop", "second-start", "second-ready", "second-stop", "session-deleted", "socket-closed"]);
+    assert.equal(state.microphone, null);
+    assert.equal(state.sessionId, null);
   } finally {
     restoreDocument();
   }

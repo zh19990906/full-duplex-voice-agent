@@ -42,9 +42,19 @@ export function bootResearchConsole(
   const api = createApiClient(appConfig);
   const timeline = new EventTimeline(byId("timeline"));
   const audioOutput = new BrowserAudioOutput();
-  const state = { sessionId: null, socket: null, microphone: null, microphoneStart: Promise.resolve() };
+  const state = { sessionId: null, socket: null, microphone: null, microphoneAction: Promise.resolve() };
 
   const setStatus = (text) => { byId("session-status").textContent = text; };
+  const queueMicrophoneAction = (action) => {
+    const pending = state.microphoneAction.then(action, action);
+    state.microphoneAction = pending.catch(() => {});
+    return pending;
+  };
+  const stopActiveMicrophone = async () => {
+    const microphone = state.microphone;
+    state.microphone = null;
+    await microphone?.stop();
+  };
   const appendChat = (role, text) => {
     const item = documentRef.createElement("div");
     item.className = `chat-message ${role}`;
@@ -82,9 +92,9 @@ export function bootResearchConsole(
 
   byId("close-session").addEventListener("click", async () => {
     if (!state.sessionId) return;
+    await queueMicrophoneAction(stopActiveMicrophone);
     await api.deleteSession(state.sessionId);
     state.socket?.close();
-    state.microphone?.stop();
     audioOutput.stop();
     setStatus("closed");
     state.sessionId = null;
@@ -107,18 +117,22 @@ export function bootResearchConsole(
   byId("start-mic").addEventListener("click", async () => {
     if (!state.socket) return setStatus("请先创建会话");
     const startMicrophone = async () => {
-      await state.microphone?.stop();
+      await stopActiveMicrophone();
       const microphone = microphoneFactory({
         onChunk: (buffer) => state.socket.sendAudio(buffer),
         onStateChange: (value) => { byId("mic-status").textContent = value; },
       });
       state.microphone = microphone;
-      await microphone.start();
+      try {
+        await microphone.start();
+      } catch (error) {
+        if (state.microphone === microphone) state.microphone = null;
+        throw error;
+      }
     };
-    state.microphoneStart = state.microphoneStart.then(startMicrophone, startMicrophone);
-    await state.microphoneStart;
+    await queueMicrophoneAction(startMicrophone);
   });
-  byId("stop-mic").addEventListener("click", () => state.microphone?.stop());
+  byId("stop-mic").addEventListener("click", () => queueMicrophoneAction(stopActiveMicrophone));
 
   return { state, api, timeline };
 }

@@ -101,3 +101,42 @@ exit 0; no output
 ### Fix Round 1 self-review and concerns
 
 Verified that only capture/app lifecycle and PCM byte serialization changed; `BrowserAudioOutput` remains untouched. The deferred transfer-list test wording/coverage was not broadened. No subagents or external reviewers were used. The existing physical-browser AudioWorklet smoke-test concern remains.
+
+## Fix Round 2
+
+### Delivered
+
+- Replaced the Start-only promise with one error-tolerant microphone action chain shared by Start, Stop, and Close capture effects.
+- Stop now waits behind prior starts, stops the final active microphone, and clears `state.microphone`.
+- Close queues and awaits capture shutdown before deleting the session, closing the socket, and clearing session state.
+
+### TDD evidence
+
+RED against `732dbc1`:
+
+```text
+$ node --test tests/frontend_audio_capture_test.mjs
+tests 10; pass 8; fail 2
+- Start → Start → Stop stopped the first microphone immediately, then left the second microphone live.
+- Start → Start → Close deleted/closed the session before the second microphone started, then left it live.
+```
+
+GREEN:
+
+```text
+$ node --test tests/frontend_audio_capture_test.mjs
+tests 10; pass 10; fail 0
+
+$ python3 -m unittest tests.test_frontend_audio_capture tests.test_web_ui tests.test_frontend_streaming -v
+Ran 10 tests ... OK
+
+$ python3 -m unittest discover -s tests
+Ran 282 tests ... OK
+
+$ git diff --check
+exit 0; no output
+```
+
+### Fix Round 2 self-review and concerns
+
+The queue catches an action failure only for scheduling the next action; each initiating handler still receives its own failure. Close awaits queued capture shutdown before session teardown. Playback remains untouched. No subagents or external reviewers were used. The physical-browser AudioWorklet smoke-test concern remains.
