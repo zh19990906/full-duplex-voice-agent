@@ -18,6 +18,7 @@ class WebUiTests(unittest.TestCase):
             "src/api.js",
             "src/websocket.js",
             "src/audio.js",
+            "src/capture-worklet.js",
             "src/timeline.js",
         }
 
@@ -60,8 +61,13 @@ class WebUiTests(unittest.TestCase):
 
     def test_audio_module_uses_browser_boundaries_only(self):
         audio = (FRONTEND / "src/audio.js").read_text(encoding="utf-8")
-        self.assertIn("MediaRecorder", audio)
+        capture_worklet = (FRONTEND / "src/capture-worklet.js").read_text(encoding="utf-8")
+        self.assertNotIn("MediaRecorder", audio)
         self.assertIn("AudioContext", audio)
+        self.assertIn("AudioWorkletNode", audio)
+        self.assertIn("PcmMicrophoneInput", audio)
+        self.assertIn("PcmFrameEncoder", capture_worklet)
+        self.assertIn("StreamingResampler", capture_worklet)
         self.assertIn("Int16Array", audio)
         self.assertIn("createBuffer", audio)
         self.assertIn("context.resume", audio)

@@ -1,29 +1,92 @@
-export class MicrophoneInput {
+export class PcmMicrophoneInput {
   constructor({ onChunk, onStateChange = () => {} } = {}) {
     this.onChunk = onChunk;
     this.onStateChange = onStateChange;
-    this.recorder = null;
     this.stream = null;
+    this.context = null;
+    this.source = null;
+    this.worklet = null;
+    this.starting = null;
+    this.stopping = null;
+    this.cancelStart = false;
   }
 
-  async start() {
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    this.recorder = new MediaRecorder(this.stream);
-    this.recorder.addEventListener("dataavailable", (event) => {
-      if (event.data.size > 0) this.onChunk?.(event.data);
+  start() {
+    if (this.starting) return this.starting;
+    if (this.stopping) return this.stopping.then(() => this.start());
+    if (this.context) return Promise.resolve();
+    this.cancelStart = false;
+    this.starting = this.#start().finally(() => { this.starting = null; });
+    return this.starting;
+  }
+
+  async #start() {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
     });
-    this.recorder.addEventListener("start", () => this.onStateChange("录音中"));
-    this.recorder.addEventListener("stop", () => this.onStateChange("已停止"));
-    this.recorder.start(250);
+    if (this.cancelStart) return this.#release({ stream });
+    const context = new AudioContext();
+    try {
+      await context.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url));
+      if (this.cancelStart) return this.#release({ stream, context });
+      const source = context.createMediaStreamSource(stream);
+      const worklet = new AudioWorkletNode(context, "pcm-capture-processor");
+      worklet.port.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) this.onChunk?.(event.data);
+      };
+      source.connect(worklet);
+      worklet.connect(context.destination);
+      if (this.cancelStart) return this.#release({ stream, context, source, worklet });
+      this.stream = stream;
+      this.context = context;
+      this.source = source;
+      this.worklet = worklet;
+      this.onStateChange("录音中");
+    } catch (error) {
+      await this.#release({ stream, context });
+      throw error;
+    }
   }
 
   stop() {
-    this.recorder?.stop();
-    this.stream?.getTracks().forEach((track) => track.stop());
-    this.recorder = null;
-    this.stream = null;
+    if (this.stopping) return this.stopping;
+    this.cancelStart = true;
+    const start = this.starting;
+    this.stopping = (async () => {
+      if (start) await start;
+      const released = await this.#release();
+      if (released) this.onStateChange("已停止");
+    })().finally(() => { this.stopping = null; });
+    return this.stopping;
+  }
+
+  async #release(resources = this) {
+    const { stream, context, source, worklet } = resources;
+    const hasResources = Boolean(stream || context || source || worklet);
+    if (worklet) {
+      worklet.port.onmessage = null;
+      worklet.port.close?.();
+      worklet.disconnect?.();
+    }
+    source?.disconnect?.();
+    stream?.getTracks().forEach((track) => track.stop());
+    await context?.close?.();
+    if (resources === this) {
+      this.stream = null;
+      this.context = null;
+      this.source = null;
+      this.worklet = null;
+    }
+    return hasResources;
   }
 }
+
+export const MicrophoneInput = PcmMicrophoneInput;
 
 export class BrowserAudioOutput {
   constructor() {

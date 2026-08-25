@@ -34,8 +34,8 @@ export class AgentWebSocket extends EventTarget {
     this.socket?.send(JSON.stringify({ type: "text", text }));
   }
 
-  sendAudio(chunk) {
-    this.socket?.send(chunk);
+  sendAudio(frame) {
+    this.socket?.send(frame);
   }
 
   close() {

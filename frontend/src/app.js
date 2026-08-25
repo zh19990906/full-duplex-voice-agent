@@ -1,6 +1,6 @@
 import { appConfig } from "../config.js";
 import { createApiClient } from "./api.js";
-import { MicrophoneInput, BrowserAudioOutput } from "./audio.js";
+import { PcmMicrophoneInput, BrowserAudioOutput } from "./audio.js";
 import { EventTimeline } from "./timeline.js";
 import { AgentWebSocket, EVENT_TYPES } from "./websocket.js";
 
@@ -103,8 +103,8 @@ export function bootResearchConsole(documentRef = document) {
 
   byId("start-mic").addEventListener("click", async () => {
     if (!state.socket) return setStatus("请先创建会话");
-    state.microphone = new MicrophoneInput({
-      onChunk: (chunk) => chunk.arrayBuffer().then((buffer) => state.socket.sendAudio(buffer)),
+    state.microphone = new PcmMicrophoneInput({
+      onChunk: (buffer) => state.socket.sendAudio(buffer),
       onStateChange: (value) => { byId("mic-status").textContent = value; },
     });
     await state.microphone.start();
