@@ -30,6 +30,35 @@ class ResponsePipelineResult:
     stale: bool = False
 
 
+@dataclass(frozen=True)
+class ResponseStreamEnd:
+    """Terminal queue control item for one completed current response."""
+
+    response_id: str
+    generation_epoch: int
+    final_segment_id: int | None
+    status: str = "completed"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.response_id, str) or not self.response_id:
+            raise ValueError("response_id must be a nonempty string")
+        if isinstance(self.generation_epoch, bool) or not isinstance(
+            self.generation_epoch, int
+        ):
+            raise TypeError("generation_epoch must be an integer")
+        if self.generation_epoch < 0:
+            raise ValueError("generation_epoch must be nonnegative")
+        if self.final_segment_id is not None:
+            if isinstance(self.final_segment_id, bool) or not isinstance(
+                self.final_segment_id, int
+            ):
+                raise TypeError("final_segment_id must be an integer or None")
+            if self.final_segment_id < 0:
+                raise ValueError("final_segment_id must be nonnegative")
+        if self.status != "completed":
+            raise ValueError("ResponseStreamEnd status must be 'completed'")
+
+
 class RealtimeResponsePipeline:
     """Serialize token generation and enqueue only current stable text."""
 
@@ -67,16 +96,21 @@ class RealtimeResponsePipeline:
         allocator = IdentifierAllocator()
         self._response_id_factory = response_id_factory or allocator.next_response_id
         self._run_lock = asyncio.Lock()
+        self._provider_needs_reset = False
 
     async def run(self, prompt: str) -> ResponsePipelineResult:
         """Generate one response without advancing the caller-owned epoch clock."""
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
         async with self._run_lock:
+            if self._provider_needs_reset and not self._externally_cancelled():
+                await _reset_provider(self.llm)
+                self._provider_needs_reset = False
             response_id = self._next_response_id()
             epoch = self.generation_clock.current
             self.segmenter.reset()
             pieces: list[str] = []
+            final_segment_id: int | None = None
             provider_cancelled = False
 
             async def stop_provider() -> None:
@@ -84,6 +118,7 @@ class RealtimeResponsePipeline:
                 if provider_cancelled:
                     return
                 provider_cancelled = True
+                self._provider_needs_reset = True
                 await _interrupt_provider(self.llm)
 
             try:
@@ -126,6 +161,7 @@ class RealtimeResponsePipeline:
                             if not await self._enqueue(segment, response_id, epoch):
                                 await stop_provider()
                                 return self._result(response_id, epoch, pieces)
+                            final_segment_id = segment.segment_id
                     if token.is_final:
                         break
                 if not self._is_current(epoch):
@@ -135,6 +171,11 @@ class RealtimeResponsePipeline:
                     if not await self._enqueue(segment, response_id, epoch):
                         await stop_provider()
                         return self._result(response_id, epoch, pieces)
+                    final_segment_id = segment.segment_id
+                terminal = ResponseStreamEnd(response_id, epoch, final_segment_id)
+                if not await self._enqueue_item(terminal, epoch):
+                    await stop_provider()
+                    return self._result(response_id, epoch, pieces)
                 return self._result(response_id, epoch, pieces, cancelled=False, stale=False)
             except asyncio.CancelledError:
                 await stop_provider()
@@ -164,9 +205,12 @@ class RealtimeResponsePipeline:
             response_id,
             epoch,
         )
+        return await self._enqueue_item(tagged, epoch)
+
+    async def _enqueue_item(self, item: TextSegment | ResponseStreamEnd, epoch: int) -> bool:
         while self._is_current(epoch):
             try:
-                self.segment_queue.put_nowait(tagged)
+                self.segment_queue.put_nowait(item)
                 return self._is_current(epoch)
             except asyncio.QueueFull:
                 await asyncio.sleep(self.capacity_poll_seconds)
@@ -174,8 +218,11 @@ class RealtimeResponsePipeline:
 
     def _is_current(self, epoch: int) -> bool:
         return self.generation_clock.is_current(epoch) and not (
-            self.cancellation_token is not None and self.cancellation_token.is_cancelled()
+            self._externally_cancelled()
         )
+
+    def _externally_cancelled(self) -> bool:
+        return self.cancellation_token is not None and self.cancellation_token.is_cancelled()
 
     def _next_response_id(self) -> str:
         response_id = self._response_id_factory()
@@ -192,9 +239,7 @@ class RealtimeResponsePipeline:
         cancelled: bool | None = None,
         stale: bool | None = None,
     ) -> ResponsePipelineResult:
-        was_cancelled = (
-            self.cancellation_token is not None and self.cancellation_token.is_cancelled()
-        )
+        was_cancelled = self._externally_cancelled()
         was_stale = not self.generation_clock.is_current(epoch)
         return ResponsePipelineResult(
             response_id=response_id,
@@ -222,4 +267,13 @@ async def _interrupt_provider(provider: Any) -> None:
         await result
 
 
-__all__ = ["RealtimeResponsePipeline", "ResponsePipelineResult"]
+async def _reset_provider(provider: Any) -> None:
+    method = getattr(provider, "reset", None)
+    if not callable(method):
+        return
+    result = method()
+    if inspect.isawaitable(result):
+        await result
+
+
+__all__ = ["RealtimeResponsePipeline", "ResponsePipelineResult", "ResponseStreamEnd"]

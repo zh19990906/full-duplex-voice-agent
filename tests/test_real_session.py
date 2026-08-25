@@ -17,6 +17,15 @@ class FakeLLM:
         self.cancelled = True
 
 
+class PunctuationThenEmptyFinalLLM:
+    async def stream_tokens(self, prompt):
+        yield TokenChunk("punctuation", "你好。", 1.0, False)
+        yield TokenChunk("final", "", 2.0, True)
+
+    async def cancel(self):
+        return None
+
+
 class FakeTTS:
     async def stream_audio(self, text):
         self.text = text
@@ -60,6 +69,27 @@ class BlockingTTS:
 
     async def interrupt(self):
         self.interrupted = True
+
+
+class BlockingStartupThenWorkingTTS:
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.calls = 0
+        self.interrupted = 0
+
+    async def stream_audio(self, text):
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            await asyncio.Event().wait()
+
+        async def chunks():
+            yield AudioChunk(f"audio-{self.calls}", text.encode(), 3.0, True)
+
+        return chunks()
+
+    async def interrupt(self):
+        self.interrupted += 1
 
 
 class FailingTTS:
@@ -137,6 +167,23 @@ class RealModelSessionTests(unittest.IsolatedAsyncioTestCase):
             [b"Hello", b" there"],
         )
 
+    async def test_empty_qwen_final_sentinel_completes_response_without_duplicate_tts(self):
+        tts = SegmentedTTS()
+        session = RealModelSession(
+            PunctuationThenEmptyFinalLLM(),
+            tts,
+            lambda _value: None,
+            segmenter=LanguageAwareTextSegmenter(first_min_chars=1),
+        )
+
+        response = await session.run("question")
+
+        self.assertEqual(response, "你好。")
+        self.assertEqual(tts.calls, ["你好。"])
+        self.assertIsNotNone(session.last_response_end)
+        self.assertEqual(session.last_response_end.final_segment_id, 0)
+        self.assertEqual(session.last_response_end.status, "completed")
+
     async def test_interrupt_invalidates_active_epoch_and_discards_late_tts_audio(self):
         events = []
         tts = BlockingTTS()
@@ -157,6 +204,30 @@ class RealModelSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.generation_clock.current, active_epoch + 1)
         self.assertTrue(tts.interrupted)
         self.assertEqual([event for event in events if isinstance(event, AudioChunk)], [])
+
+    async def test_interrupt_cancels_blocked_tts_start_and_allows_a_later_run(self):
+        events = []
+        tts = BlockingStartupThenWorkingTTS()
+        session = RealModelSession(
+            FakeLLM(),
+            tts,
+            events.append,
+            segmenter=LanguageAwareTextSegmenter(first_min_words=1, next_min_words=1),
+        )
+
+        first = asyncio.create_task(session.run("question"))
+        await tts.entered.wait()
+        await session.interrupt()
+        first_response = await asyncio.wait_for(first, timeout=0.5)
+        second_response = await asyncio.wait_for(session.run("again"), timeout=0.5)
+
+        self.assertEqual(first_response, "Hello there")
+        self.assertEqual(second_response, "Hello there")
+        self.assertEqual(tts.calls, 3)
+        self.assertEqual(
+            [event.audio_data for event in events if isinstance(event, AudioChunk)],
+            [b"Hello", b" there"],
+        )
 
     async def test_tts_consumer_failure_cancels_generation_and_propagates_without_deadlock(self):
         llm = FakeLLM()

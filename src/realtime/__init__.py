@@ -8,7 +8,11 @@ from .protocol import (
 )
 from .cancellation import ActiveTaskSlot, CancellationToken
 from .identifiers import GenerationClock, IdentifierAllocator
-from .response_pipeline import RealtimeResponsePipeline, ResponsePipelineResult
+from .response_pipeline import (
+    RealtimeResponsePipeline,
+    ResponsePipelineResult,
+    ResponseStreamEnd,
+)
 from .session_state import (
     ConversationMode,
     FloorState,
@@ -31,6 +35,7 @@ __all__ = [
     "RealtimeEnvelope",
     "ResponseRecord",
     "ResponsePipelineResult",
+    "ResponseStreamEnd",
     "ResponseState",
     "SessionState",
     "TextSegment",

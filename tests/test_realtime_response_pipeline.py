@@ -4,7 +4,11 @@ import unittest
 from src.llm_runtime.stream import TokenChunk
 from src.realtime.cancellation import CancellationToken
 from src.realtime.identifiers import GenerationClock
-from src.realtime.response_pipeline import RealtimeResponsePipeline, ResponsePipelineResult
+from src.realtime.response_pipeline import (
+    RealtimeResponsePipeline,
+    ResponsePipelineResult,
+    ResponseStreamEnd,
+)
 from src.realtime.text_segmenter import LanguageAwareTextSegmenter, TextSegment
 
 
@@ -42,6 +46,50 @@ class RecordingSegmentQueue:
 
     def put_nowait(self, item):
         self.items.append(item)
+
+
+class ResetAfterCancelProvider:
+    def __init__(self):
+        self.first_seen = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+        self.reset_calls = 0
+        self.run_count = 0
+
+    async def stream_tokens(self, prompt):
+        if self.cancelled:
+            raise RuntimeError("provider remains cancelled")
+        self.run_count += 1
+        if self.run_count == 1:
+            self.first_seen.set()
+            yield "旧"
+            await self.release.wait()
+            yield "回答。"
+            return
+        yield TokenChunk("fresh", "新回答。", 3.0, True)
+
+    async def cancel(self):
+        self.cancelled = True
+        self.release.set()
+
+    def reset(self):
+        self.reset_calls += 1
+        self.cancelled = False
+
+
+class ResetProbeProvider:
+    def __init__(self):
+        self.reset_calls = 0
+        self.cancel_calls = 0
+
+    async def stream_tokens(self, prompt):
+        yield TokenChunk("unused", "不应生成", 1.0, True)
+
+    async def cancel(self):
+        self.cancel_calls += 1
+
+    def reset(self):
+        self.reset_calls += 1
 
 
 class RealtimeResponsePipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -92,9 +140,10 @@ class RealtimeResponsePipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([token.text for token in published], ["你好，", "世界。"])
         self.assertTrue(all(token.response_id == result.response_id for token in published))
         self.assertTrue(all(token.generation_epoch == result.generation_epoch for token in published))
-        self.assertEqual([item.text for item in queue.items], ["你好，", "世界。"])
-        self.assertEqual([item.segment_id for item in queue.items], [0, 1])
-        self.assertTrue(all(item.response_id == result.response_id for item in queue.items))
+        segments = [item for item in queue.items if isinstance(item, TextSegment)]
+        self.assertEqual([item.text for item in segments], ["你好，", "世界。"])
+        self.assertEqual([item.segment_id for item in segments], [0, 1])
+        self.assertTrue(all(item.response_id == result.response_id for item in segments))
 
     async def test_final_token_marks_the_last_remaining_segment_final(self):
         queue = RecordingSegmentQueue()
@@ -108,9 +157,54 @@ class RealtimeResponsePipelineTests(unittest.IsolatedAsyncioTestCase):
         await pipeline.run("问题")
 
         self.assertEqual(
-            [(segment.text, segment.is_final) for segment in queue.items],
+            [
+                (segment.text, segment.is_final)
+                for segment in queue.items
+                if isinstance(segment, TextSegment)
+            ],
             [("最后一句。", True)],
         )
+        self.assertIsInstance(queue.items[-1], ResponseStreamEnd)
+
+    async def test_qwen_empty_final_sentinel_confirms_prior_punctuation_without_duplicate_tts_text(self):
+        queue = RecordingSegmentQueue()
+        pipeline = RealtimeResponsePipeline(
+            llm=ControlledTokenProvider(
+                (
+                    TokenChunk("punctuation", "你好。", 1.0, False),
+                    TokenChunk("final", "", 2.0, True),
+                )
+            ),
+            segment_queue=queue,
+            generation_clock=GenerationClock(),
+            segmenter=LanguageAwareTextSegmenter(first_min_chars=1),
+        )
+
+        result = await pipeline.run("问题")
+
+        text_segments = [item for item in queue.items if isinstance(item, TextSegment)]
+        endings = [item for item in queue.items if isinstance(item, ResponseStreamEnd)]
+        self.assertEqual([(item.text, item.is_final) for item in text_segments], [("你好。", False)])
+        self.assertEqual(len(endings), 1)
+        self.assertEqual(endings[0].response_id, result.response_id)
+        self.assertEqual(endings[0].generation_epoch, result.generation_epoch)
+        self.assertEqual(endings[0].final_segment_id, 0)
+        self.assertEqual(endings[0].status, "completed")
+
+    async def test_empty_successful_response_emits_only_an_identity_bearing_terminal_marker(self):
+        queue = RecordingSegmentQueue()
+        pipeline = RealtimeResponsePipeline(
+            llm=ControlledTokenProvider((TokenChunk("final", "", 1.0, True),)),
+            segment_queue=queue,
+            generation_clock=GenerationClock(),
+        )
+
+        result = await pipeline.run("问题")
+
+        self.assertEqual(len(queue.items), 1)
+        self.assertIsInstance(queue.items[0], ResponseStreamEnd)
+        self.assertEqual(queue.items[0].response_id, result.response_id)
+        self.assertIsNone(queue.items[0].final_segment_id)
 
     async def test_epoch_change_while_queue_is_full_never_enqueues_stale_segment(self):
         clock = GenerationClock()
@@ -183,8 +277,9 @@ class RealtimeResponsePipelineTests(unittest.IsolatedAsyncioTestCase):
         first, second = await asyncio.gather(pipeline.run("a"), pipeline.run("b"))
 
         self.assertNotEqual(first.response_id, second.response_id)
-        self.assertEqual([item.segment_id for item in queue.items], [0, 0])
-        self.assertEqual([item.response_id for item in queue.items], [first.response_id, second.response_id])
+        segments = [item for item in queue.items if isinstance(item, TextSegment)]
+        self.assertEqual([item.segment_id for item in segments], [0, 0])
+        self.assertEqual([item.response_id for item in segments], [first.response_id, second.response_id])
 
     async def test_cancelling_run_cancels_provider_and_leaves_no_producer_work(self):
         clock = GenerationClock()
@@ -215,6 +310,50 @@ class RealtimeResponsePipelineTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "provider failed"):
             await pipeline.run("问题")
+
+    async def test_pipeline_resets_its_own_cancelled_provider_before_a_later_valid_run(self):
+        clock = GenerationClock()
+        llm = ResetAfterCancelProvider()
+        queue = RecordingSegmentQueue()
+        pipeline = RealtimeResponsePipeline(
+            llm=llm,
+            segment_queue=queue,
+            generation_clock=clock,
+            segmenter=LanguageAwareTextSegmenter(first_min_chars=1),
+        )
+        first = asyncio.create_task(pipeline.run("旧问题"))
+        await llm.first_seen.wait()
+        clock.advance()
+        llm.release.set()
+        stale = await first
+
+        fresh = await pipeline.run("新问题")
+
+        self.assertTrue(stale.stale)
+        self.assertEqual(fresh.text, "新回答。")
+        self.assertEqual(llm.reset_calls, 1)
+        self.assertEqual(
+            [item.text for item in queue.items if isinstance(item, TextSegment)],
+            ["新回答。"],
+        )
+
+    async def test_externally_cancelled_token_never_resets_the_provider(self):
+        cancellation = CancellationToken()
+        cancellation.cancel()
+        llm = ResetProbeProvider()
+        pipeline = RealtimeResponsePipeline(
+            llm=llm,
+            segment_queue=RecordingSegmentQueue(),
+            generation_clock=GenerationClock(),
+            cancellation_token=cancellation,
+        )
+
+        first = await pipeline.run("问题")
+        second = await pipeline.run("问题")
+
+        self.assertTrue(first.cancelled)
+        self.assertTrue(second.cancelled)
+        self.assertEqual(llm.reset_calls, 0)
 
 
 if __name__ == "__main__":
