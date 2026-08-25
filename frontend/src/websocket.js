@@ -17,8 +17,8 @@ export class AgentWebSocket extends EventTarget {
   }
 
   connect(sessionId) {
-    const separator = this.url.includes("?") ? "&" : "?";
-    this.socket = new WebSocket(`${this.url}${separator}session_id=${encodeURIComponent(sessionId)}`);
+    const separator = this.url.endsWith("/") ? "" : "/";
+    this.socket = new WebSocket(`${this.url}${separator}${encodeURIComponent(sessionId)}`);
     this.socket.addEventListener("message", (message) => {
       const event = typeof message.data === "string" ? JSON.parse(message.data) : message.data;
       const type = normalizeEventName(event.event || event.type || "message");

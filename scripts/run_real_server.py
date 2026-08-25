@@ -103,10 +103,9 @@ def build_app(args: argparse.Namespace):
         await publish(session_id, session.sockets, {"event": "text_response", "payload": {"text": response}})
         return {"session_id": session_id, "response": response}
 
-    @app.websocket("/ws")
-    async def websocket_endpoint(websocket: WebSocket):
+    async def handle_websocket(websocket: WebSocket, session_id: str | None = None):
         await websocket.accept()
-        session_id = websocket.query_params.get("session_id")
+        session_id = session_id or websocket.query_params.get("session_id")
         session = sessions.get(session_id or "")
         if session is None:
             await websocket.send_json({
@@ -140,6 +139,16 @@ def build_app(args: argparse.Namespace):
             pass
         finally:
             session.sockets.discard(websocket)
+
+    @app.websocket("/ws/{session_id}")
+    async def websocket_session_endpoint(websocket: WebSocket, session_id: str):
+        await handle_websocket(websocket, session_id)
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        # Keep the query-string form for older clients; the frontend uses the
+        # explicit path form because some deployments do not route this form.
+        await handle_websocket(websocket)
 
     frontend = ROOT / "frontend"
 

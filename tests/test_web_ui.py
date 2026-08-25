@@ -47,6 +47,11 @@ class WebUiTests(unittest.TestCase):
             self.assertIn(event_name, websocket)
         self.assertIn("addEventListener", websocket)
 
+    def test_websocket_uses_session_path_for_backend_route(self):
+        websocket = (FRONTEND / "src/websocket.js").read_text(encoding="utf-8")
+        self.assertIn("this.url.endsWith(\"/\")", websocket)
+        self.assertIn("encodeURIComponent(sessionId)", websocket)
+
     def test_audio_module_uses_browser_boundaries_only(self):
         audio = (FRONTEND / "src/audio.js").read_text(encoding="utf-8")
         self.assertIn("MediaRecorder", audio)
