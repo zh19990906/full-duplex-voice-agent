@@ -37,6 +37,7 @@ export function bootResearchConsole(documentRef = document) {
   };
 
   byId("create-session").addEventListener("click", async () => {
+    await audioOutput.unlock();
     const session = await api.createSession();
     state.sessionId = session.session_id;
     byId("session-id").textContent = state.sessionId;
@@ -56,6 +57,7 @@ export function bootResearchConsole(documentRef = document) {
 
   byId("message-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    await audioOutput.unlock();
     if (!state.sessionId) return setStatus("create a session first");
     const input = byId("message");
     const message = input.value.trim();

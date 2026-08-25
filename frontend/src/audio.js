@@ -31,6 +31,11 @@ export class BrowserAudioOutput {
     this.nextStart = 0;
   }
 
+  async unlock() {
+    this.context ||= new AudioContext();
+    if (this.context.state === "suspended") await this.context.resume();
+  }
+
   async playBase64(audioData, sampleRate = 24000) {
     if (!audioData) return;
     this.context ||= new AudioContext();
