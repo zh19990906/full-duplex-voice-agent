@@ -58,7 +58,7 @@ export function bootResearchConsole(documentRef = document) {
   byId("message-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     await audioOutput.unlock();
-    if (!state.sessionId) return setStatus("create a session first");
+    if (!state.sessionId) return setStatus("请先创建会话");
     const input = byId("message");
     const message = input.value.trim();
     if (!message) return;
@@ -69,7 +69,7 @@ export function bootResearchConsole(documentRef = document) {
   });
 
   byId("start-mic").addEventListener("click", async () => {
-    if (!state.socket) return setStatus("create a session first");
+    if (!state.socket) return setStatus("请先创建会话");
     state.microphone = new MicrophoneInput({
       onChunk: (chunk) => chunk.arrayBuffer().then((buffer) => state.socket.sendAudio(buffer)),
       onStateChange: (value) => { byId("mic-status").textContent = value; },

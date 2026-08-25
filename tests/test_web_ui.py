@@ -26,6 +26,11 @@ class WebUiTests(unittest.TestCase):
             {path.relative_to(FRONTEND).as_posix() for path in FRONTEND.rglob("*") if path.is_file()},
         )
 
+    def test_frontend_visible_copy_is_chinese(self):
+        index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+        for label in ("全双工语音助手", "创建会话", "关闭会话", "发送", "开启麦克风", "事件时间线"):
+            self.assertIn(label, index)
+
     def test_api_endpoints_are_configurable(self):
         config = (FRONTEND / "config.js").read_text(encoding="utf-8")
         self.assertIn("api", config)

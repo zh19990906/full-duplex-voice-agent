@@ -3,59 +3,59 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Full Duplex Voice Agent</title>
+    <title>全双工语音助手</title>
     <link rel="stylesheet" href="style.css">
   </head>
   <body>
     <header class="topbar">
       <div>
-        <p class="eyebrow">Research Console</p>
-        <h1>Full Duplex Voice Agent</h1>
+        <p class="eyebrow">语音助手控制台</p>
+        <h1>全双工语音助手</h1>
       </div>
       <div class="session-controls">
-        <span>Session: <code id="session-id">none</code></span>
-        <span id="session-status" class="status">idle</span>
-        <button id="create-session" class="primary">Create</button>
-        <button id="close-session">Close</button>
+        <span>会话：<code id="session-id">未创建</code></span>
+        <span id="session-status" class="status">空闲</span>
+        <button id="create-session" class="primary">创建会话</button>
+        <button id="close-session">关闭会话</button>
       </div>
     </header>
 
     <main class="layout">
       <section class="card conversation">
-        <div class="section-heading"><h2>Conversation</h2><span id="mic-status">microphone off</span></div>
+        <div class="section-heading"><h2>对话</h2><span id="mic-status">麦克风未开启</span></div>
         <div id="messages" class="messages" aria-live="polite"></div>
         <form id="message-form" class="message-form">
-          <input id="message" autocomplete="off" placeholder="Type a message...">
-          <button class="primary" type="submit">Send</button>
+          <input id="message" autocomplete="off" placeholder="输入消息...">
+          <button class="primary" type="submit">发送</button>
         </form>
         <div class="voice-controls">
-          <button id="start-mic">Start microphone</button>
-          <button id="stop-mic">Stop microphone</button>
+          <button id="start-mic">开启麦克风</button>
+          <button id="stop-mic">停止麦克风</button>
         </div>
       </section>
 
       <aside class="sidebar">
         <section class="card">
-          <div class="section-heading"><h2>Agent State</h2></div>
-          <pre id="agent-state">Waiting for events...</pre>
+          <div class="section-heading"><h2>助手状态</h2></div>
+          <pre id="agent-state">等待事件...</pre>
         </section>
         <section class="card">
-          <div class="section-heading"><h2>Tools</h2></div>
-          <pre id="tool-output">No tool activity.</pre>
+          <div class="section-heading"><h2>工具调用</h2></div>
+          <pre id="tool-output">暂无工具调用。</pre>
         </section>
         <section class="card experiment-panel">
-          <div class="section-heading"><h2>Experiment</h2></div>
+          <div class="section-heading"><h2>实验配置</h2></div>
           <dl>
-            <dt>Variant</dt><dd>baseline</dd>
-            <dt>Model</dt><dd>llama_cpp</dd>
-            <dt>Prompt</dt><dd>v1</dd>
-            <dt>Memory</dt><dd>recent_20</dd>
+            <dt>方案</dt><dd>基线</dd>
+            <dt>模型</dt><dd>Qwen Transformers</dd>
+            <dt>提示词</dt><dd>v1</dd>
+            <dt>记忆</dt><dd>最近 20 条</dd>
           </dl>
         </section>
       </aside>
 
       <section class="card timeline-panel">
-        <div class="section-heading"><h2>Event Timeline</h2><span>live</span></div>
+        <div class="section-heading"><h2>事件时间线</h2><span>实时</span></div>
         <ol id="timeline" class="timeline"></ol>
       </section>
     </main>

@@ -12,8 +12,8 @@ export class MicrophoneInput {
     this.recorder.addEventListener("dataavailable", (event) => {
       if (event.data.size > 0) this.onChunk?.(event.data);
     });
-    this.recorder.addEventListener("start", () => this.onStateChange("recording"));
-    this.recorder.addEventListener("stop", () => this.onStateChange("stopped"));
+    this.recorder.addEventListener("start", () => this.onStateChange("录音中"));
+    this.recorder.addEventListener("stop", () => this.onStateChange("已停止"));
     this.recorder.start(250);
   }
 
