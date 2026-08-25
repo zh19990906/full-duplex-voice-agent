@@ -52,6 +52,12 @@ class WebUiTests(unittest.TestCase):
         self.assertIn("this.url.endsWith(\"/\")", websocket)
         self.assertIn("encodeURIComponent(sessionId)", websocket)
 
+    def test_real_server_uses_lifespan_instead_of_deprecated_events(self):
+        server = (Path(__file__).parents[1] / "scripts" / "run_real_server.py").read_text(encoding="utf-8")
+        self.assertIn("asynccontextmanager", server)
+        self.assertIn("lifespan=lifespan", server)
+        self.assertNotIn("@app.on_event(\"shutdown\")", server)
+
     def test_audio_module_uses_browser_boundaries_only(self):
         audio = (FRONTEND / "src/audio.js").read_text(encoding="utf-8")
         self.assertIn("MediaRecorder", audio)

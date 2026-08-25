@@ -7,6 +7,7 @@ import asyncio
 import json
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,7 +25,6 @@ def build_app(args: argparse.Namespace):
     from src.api.events import ApiEventSerializer
     from src.runtime_app.real_session import RealModelSession
 
-    app = FastAPI(title="Full Duplex Voice Agent")
     llm = TransformersQwenProvider(args.llm_model, device="cuda")
     tts = CosyVoiceWorkerClient(
         args.tts_model,
@@ -37,6 +37,13 @@ def build_app(args: argparse.Namespace):
     )
     sessions: dict[str, SimpleNamespace] = {}
     model_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        yield
+        await tts.close()
+
+    app = FastAPI(title="Full Duplex Voice Agent", lifespan=lifespan)
 
     def prompt_builder(text: str) -> str:
         return (
@@ -64,10 +71,6 @@ def build_app(args: argparse.Namespace):
             prompt_builder=prompt_builder,
         )
         return session
-
-    @app.on_event("shutdown")
-    async def shutdown():
-        await tts.close()
 
     @app.get("/health")
     async def health():
