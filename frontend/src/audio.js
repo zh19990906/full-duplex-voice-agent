@@ -221,11 +221,10 @@ export class BrowserPlaybackCoordinator {
     if (this.workletNode) return Promise.resolve();
     if (this.unlocking) return this.unlocking;
     const token = this.lifecycleGeneration;
-    const initialization = this.#initialize(token);
-    this.unlocking = initialization;
-    initialization.finally(() => {
+    const initialization = this.#initialize(token).finally(() => {
       if (this.unlocking === initialization) this.unlocking = null;
     });
+    this.unlocking = initialization;
     return initialization;
   }
 

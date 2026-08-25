@@ -216,6 +216,61 @@ test("concurrent unlock calls create one worklet and gain chain", async () => {
   }
 });
 
+test("failed unlock propagates each original error without unhandled rejections and can retry", async () => {
+  const resumeFailure = new Error("resume failed");
+  const moduleFailure = new Error("module failed");
+  let resumeAttempts = 0;
+  let moduleAttempts = 0;
+  class Context {
+    constructor() {
+      this.state = "suspended";
+      this.destination = {};
+      this.audioWorklet = {
+        addModule: async () => {
+          moduleAttempts += 1;
+          if (moduleAttempts === 1) throw moduleFailure;
+        },
+      };
+    }
+    async resume() {
+      resumeAttempts += 1;
+      if (resumeAttempts === 1) throw resumeFailure;
+      this.state = "running";
+    }
+    createGain() { return { gain: new FakeAudioParam(), connect() {} }; }
+  }
+  class WorkletNode {
+    constructor() { this.port = new FakePort(); }
+    connect() {}
+  }
+  const restoreContext = replaceGlobal("AudioContext", Context);
+  const restoreWorklet = replaceGlobal("AudioWorkletNode", WorkletNode);
+  const unhandled = [];
+  const observeUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", observeUnhandled);
+
+  try {
+    const coordinator = new BrowserPlaybackCoordinator();
+    await assert.rejects(coordinator.unlock(), (error) => error === resumeFailure);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(coordinator.unlocking, null);
+
+    await assert.rejects(coordinator.unlock(), (error) => error === moduleFailure);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(coordinator.unlocking, null);
+    assert.deepEqual(unhandled, []);
+
+    await coordinator.unlock();
+    assert.equal(resumeAttempts, 2);
+    assert.equal(moduleAttempts, 2);
+    assert.ok(coordinator.workletNode);
+  } finally {
+    process.off("unhandledRejection", observeUnhandled);
+    restoreContext();
+    restoreWorklet();
+  }
+});
+
 test("close during initialization invalidates the old chain and reopens at epoch zero", async () => {
   const firstModule = deferred();
   const contexts = [];
