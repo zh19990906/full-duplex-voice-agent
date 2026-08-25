@@ -13,8 +13,9 @@ CONFIG_PATH = REPOSITORY_ROOT / "configs" / "models.yaml"
 class ModelDeploymentTests(unittest.TestCase):
     def test_yaml_config_parses_profiles(self):
         config = load_model_config(CONFIG_PATH)
-        self.assertEqual(set(config.profiles), {"asr", "llm", "tts", "translation"})
+        self.assertEqual(set(config.profiles), {"asr", "llm", "policy", "tts", "translation"})
         self.assertEqual(config.profiles["asr"].provider, "whisper")
+        self.assertEqual(config.profiles["policy"].provider, "local")
         self.assertEqual(config.profiles["tts"].provider, "cosyvoice")
 
     def test_local_path_resolution(self):

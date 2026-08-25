@@ -9,6 +9,9 @@ from src.core.events.events import (
 
 from .actions import ActionType, ControllerAction
 from .states import ControllerState
+from src.realtime.policy import PolicyAction, PolicyDecision
+from src.realtime.session_state import ConversationMode, FloorState, ResponseState, SessionState
+from src.realtime.speech_fusion import SpeechCandidateEvent
 
 
 class ConversationController:
@@ -41,3 +44,109 @@ class ConversationController:
             return (ControllerAction(ActionType.PROCESS_USER_REQUEST),)
 
         return ()
+
+    def handle_candidate(
+        self,
+        state: SessionState,
+        candidate: SpeechCandidateEvent,
+    ) -> tuple[ControllerAction, ...]:
+        """Apply reversible low-latency behavior before semantic confirmation."""
+        if not isinstance(state, SessionState):
+            raise TypeError("state must be SessionState")
+        if not isinstance(candidate, SpeechCandidateEvent):
+            raise TypeError("candidate must be SpeechCandidateEvent")
+        if state.response is not ResponseState.PLAYING:
+            return ()
+        state.floor = FloorState.OVERLAP
+        if candidate.event == "USER_BACKCHANNEL_CANDIDATE":
+            state.response = ResponseState.DUCKED
+            return (ControllerAction(ActionType.DUCK_RESPONSE),)
+        if candidate.event in {
+            "USER_SPEECH_START_CANDIDATE",
+            "USER_TURN_END_CANDIDATE",
+        }:
+            state.response = ResponseState.PAUSED
+            return (ControllerAction(ActionType.PAUSE_RESPONSE),)
+        return ()
+
+    def apply_policy(
+        self,
+        state: SessionState,
+        policy: PolicyDecision,
+    ) -> tuple[ControllerAction, ...]:
+        """Translate one validated policy decision into side-effect-free actions."""
+        if not isinstance(state, SessionState):
+            raise TypeError("state must be SessionState")
+        if not isinstance(policy, PolicyDecision):
+            raise TypeError("policy must be PolicyDecision")
+
+        if policy.action is PolicyAction.BACKCHANNEL:
+            actions = []
+            if state.response is ResponseState.DUCKED:
+                actions.append(ControllerAction(ActionType.RESTORE_RESPONSE))
+                state.response = ResponseState.PLAYING
+            actions.append(ControllerAction(ActionType.CONTINUE_GENERATION))
+            state.floor = FloorState.ASSISTANT
+            return tuple(actions)
+
+        if policy.action is PolicyAction.ANSWER:
+            state.floor = FloorState.USER
+            state.response = ResponseState.IDLE
+            return (
+                ControllerAction(ActionType.STOP_RESPONSE),
+                ControllerAction(ActionType.PROCESS_USER_REQUEST),
+            )
+
+        if policy.action is PolicyAction.PAUSE:
+            state.floor = FloorState.USER
+            state.response = ResponseState.PAUSED
+            return (ControllerAction(ActionType.PAUSE_RESPONSE),)
+
+        if policy.action is PolicyAction.RESUME:
+            state.floor = FloorState.ASSISTANT
+            state.response = ResponseState.PLAYING
+            return (ControllerAction(ActionType.RESUME_RESPONSE),)
+
+        if policy.action is PolicyAction.REVISE:
+            state.floor = FloorState.USER
+            state.response = ResponseState.CANCELLING
+            return (
+                ControllerAction(ActionType.STOP_RESPONSE),
+                ControllerAction(ActionType.CANCEL_GENERATION),
+                ControllerAction(ActionType.REVISE_RESPONSE),
+                ControllerAction(ActionType.PROCESS_USER_REQUEST),
+            )
+
+        if policy.action is PolicyAction.NEW_REQUEST:
+            state.floor = FloorState.USER
+            state.response = ResponseState.CANCELLING
+            return (
+                ControllerAction(ActionType.STOP_RESPONSE),
+                ControllerAction(ActionType.CANCEL_GENERATION),
+                ControllerAction(ActionType.PROCESS_USER_REQUEST),
+            )
+
+        if policy.action is PolicyAction.MODE_SWITCH:
+            target_mode = (
+                ConversationMode.CHAT
+                if policy.intent == "chat"
+                else ConversationMode.INTERPRETATION
+            )
+            state.mode = target_mode
+            return (
+                ControllerAction(
+                    ActionType.SWITCH_MODE,
+                    {
+                        "target_mode": target_mode.value,
+                        "source_language": policy.source_language,
+                        "target_language": policy.target_language,
+                    },
+                ),
+            )
+
+        state.floor = FloorState.USER
+        state.response = ResponseState.PAUSED
+        return (
+            ControllerAction(ActionType.PAUSE_RESPONSE),
+            ControllerAction(ActionType.REQUEST_CLARIFICATION),
+        )

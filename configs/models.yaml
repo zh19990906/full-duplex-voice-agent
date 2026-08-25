@@ -14,6 +14,13 @@ llm:
   device: cuda
   auto_load: true
 
+policy:
+  provider: local
+  model_id: Qwen/Qwen2.5-1.5B-Instruct
+  local_path: ./models/policy/Qwen2.5-1.5B-Instruct
+  device: cuda
+  auto_load: false
+
 tts:
   provider: cosyvoice
   model_id: example/cosyvoice-tts

@@ -13,7 +13,7 @@ SCRIPT_NAMES = (
     "download_models_modelscope.sh",
     "check_environment.sh",
 )
-MODEL_SECTIONS = ("asr", "llm", "tts", "translation")
+MODEL_SECTIONS = ("asr", "llm", "policy", "tts", "translation")
 
 
 class DeploymentConfigTests(unittest.TestCase):

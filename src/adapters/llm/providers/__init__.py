@@ -2,5 +2,6 @@
 
 from .llama_cpp import LlamaCppLLMProvider
 from .qwen_transformers import TransformersQwenProvider
+from .qwen_policy import QwenPolicyProvider
 
-__all__ = ["LlamaCppLLMProvider", "TransformersQwenProvider"]
+__all__ = ["LlamaCppLLMProvider", "QwenPolicyProvider", "TransformersQwenProvider"]
