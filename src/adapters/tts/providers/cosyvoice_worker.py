@@ -73,7 +73,7 @@ class CosyVoiceWorkerClient:
         prompt_audio: str | None = None,
         prompt_text: str | None = None,
         runtime: Any | None = None,
-        startup_timeout: float = 30.0,
+        startup_timeout: float = 120.0,
     ) -> None:
         if not model_path:
             raise ValueError("CosyVoice model_path must be supplied")
@@ -175,9 +175,16 @@ class CosyVoiceWorkerClient:
             bufsize=1,
             env=os.environ.copy(),
         )
-        line = await asyncio.wait_for(self._readline(), self.startup_timeout)
+        try:
+            line = await asyncio.wait_for(self._readline(), self.startup_timeout)
+        except asyncio.TimeoutError as exc:
+            await self._terminate_process()
+            raise RuntimeError(
+                f"CosyVoice worker did not become ready within {self.startup_timeout:.0f} seconds"
+            ) from exc
         message = json.loads(line)
         if message.get("type") != "ready":
+            await self._terminate_process()
             raise RuntimeError(f"CosyVoice worker failed to start: {message}")
 
     async def _send(self, line: str) -> None:
@@ -199,6 +206,18 @@ class CosyVoiceWorkerClient:
         if not line:
             raise RuntimeError("CosyVoice worker exited unexpectedly")
         return line
+
+    async def _terminate_process(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            await asyncio.to_thread(process.wait, 5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            await asyncio.to_thread(process.wait, 5)
 
     def _runtime_options(self, options: Mapping[str, Any]) -> dict[str, Any]:
         merged = dict(options)

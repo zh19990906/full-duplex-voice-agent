@@ -69,6 +69,7 @@ class CosyVoiceWorkerProtocolTests(unittest.TestCase):
                 prompt_text="prompt",
                 runtime=worker,
             )
+            self.assertEqual(client.startup_timeout, 120.0)
             result = await client.stream_audio("hello")
             return [item async for item in result], worker
 

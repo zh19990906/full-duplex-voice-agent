@@ -33,6 +33,7 @@ def build_app(args: argparse.Namespace):
         cosyvoice_root=args.cosy_root,
         prompt_audio=args.prompt_audio,
         prompt_text=args.prompt_text,
+        startup_timeout=args.worker_startup_timeout,
     )
     sessions: dict[str, SimpleNamespace] = {}
     model_lock = asyncio.Lock()
@@ -94,8 +95,11 @@ def build_app(args: argparse.Namespace):
             return JSONResponse({"error": "session not found"}, status_code=404)
         if not isinstance(message, str) or not message.strip():
             return JSONResponse({"error": "message must be a non-empty string"}, status_code=400)
-        async with model_lock:
-            response = await session.model.run(message)
+        try:
+            async with model_lock:
+                response = await session.model.run(message)
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
         await publish(session_id, session.sockets, {"event": "text_response", "payload": {"text": response}})
         return {"session_id": session_id, "response": response}
 
@@ -159,6 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-text", required=True)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--worker-startup-timeout", type=float, default=180.0)
     parser.add_argument("--worker-python", default="/home/CosyVoice/.venv/bin/python")
     parser.add_argument("--cosy-root", default="/home/CosyVoice")
     parser.add_argument(
