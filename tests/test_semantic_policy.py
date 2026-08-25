@@ -3,6 +3,7 @@ import json
 import math
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -82,7 +83,54 @@ class PolicySchemaTests(unittest.TestCase):
 
     def test_policy_rejects_unknown_action(self):
         with self.assertRaises(ValueError):
-            PolicyDecision.from_mapping({"action": "GUESS", "confidence": 1.0})
+            PolicyDecision.from_mapping(
+                {"action": "GUESS", "confidence": 1.0, "rationale": "not in schema"}
+            )
+
+    def test_mode_switch_requires_known_intent_and_target_for_interpretation(self):
+        invalid = [
+            {"action": "MODE_SWITCH", "confidence": 0.9, "rationale": "missing"},
+            {
+                "action": "MODE_SWITCH",
+                "confidence": 0.9,
+                "rationale": "one shot",
+                "intent": "one_shot_translation",
+                "target_language": "English",
+            },
+            {
+                "action": "MODE_SWITCH",
+                "confidence": 0.9,
+                "rationale": "no target",
+                "intent": "continuous_interpretation",
+            },
+            {
+                "action": "MODE_SWITCH",
+                "confidence": 0.9,
+                "rationale": "blank target",
+                "intent": "continuous_interpretation",
+                "target_language": "   ",
+            },
+        ]
+        for mapping in invalid:
+            with self.subTest(mapping=mapping), self.assertRaises(ValueError):
+                PolicyDecision.from_mapping(mapping)
+
+        enter = PolicyDecision(
+            PolicyAction.MODE_SWITCH,
+            0.9,
+            "enter",
+            intent="continuous_interpretation",
+            source_language=None,
+            target_language="English",
+        )
+        leave = PolicyDecision(
+            PolicyAction.MODE_SWITCH,
+            0.9,
+            "leave",
+            intent="chat",
+        )
+        self.assertEqual(enter.intent, "continuous_interpretation")
+        self.assertEqual(leave.intent, "chat")
 
     def test_policy_schema_rejects_unknown_missing_and_wrong_fields(self):
         invalid = [
@@ -143,6 +191,14 @@ class PolicySchemaTests(unittest.TestCase):
             [item.value for item in PolicyAction],
         )
         self.assertTrue(payload["policy_contract"]["strict_json_only"])
+        self.assertEqual(
+            payload["policy_contract"]["mode_switch_intents"],
+            ["chat", "continuous_interpretation"],
+        )
+        self.assertEqual(
+            payload["policy_contract"]["continuous_interpretation_requires"],
+            ["target_language"],
+        )
         self.assertNotIn("translation_keywords", payload)
 
     def test_policy_request_snapshots_mutable_state_and_candidate_context(self):
@@ -231,6 +287,24 @@ class SemanticPolicyEngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(decision.source_language)
                 self.assertIsNone(decision.target_language)
 
+    async def test_invalid_mode_switch_schema_becomes_uncertain(self):
+        class Runtime:
+            async def generate(self, prompt):
+                return json.dumps(
+                    {
+                        "action": "MODE_SWITCH",
+                        "confidence": 0.99,
+                        "rationale": "single translation is not a mode",
+                        "intent": "one_shot_translation",
+                        "target_language": "English",
+                    }
+                )
+
+        decision = await SemanticPolicyEngine(Runtime()).decide(request_for("翻译这一句"))
+
+        self.assertEqual(decision.action, PolicyAction.UNCERTAIN)
+        self.assertIsNone(decision.intent)
+
     async def test_arbitrary_runtime_failure_becomes_safe_uncertain(self):
         class Runtime:
             async def generate(self, prompt):
@@ -262,7 +336,7 @@ class SemanticPolicyEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.action, PolicyAction.UNCERTAIN)
         self.assertEqual(published, [decision])
 
-    async def test_concurrent_calls_keep_requests_isolated(self):
+    async def test_sequential_calls_keep_requests_isolated(self):
         class Runtime:
             async def generate(self, prompt):
                 text = json.loads(prompt)["user_transcript"]["text"]
@@ -271,12 +345,63 @@ class SemanticPolicyEngineTests(unittest.IsolatedAsyncioTestCase):
                 return json.dumps({"action": action, "confidence": 0.99, "rationale": text})
 
         engine = SemanticPolicyEngine(Runtime())
-        first, second = await asyncio.gather(
-            engine.decide(request_for("first")),
-            engine.decide(request_for("second")),
-        )
+        first = await engine.decide(request_for("first"))
+        second = await engine.decide(request_for("second"))
         self.assertEqual((first.action, first.rationale), (PolicyAction.PAUSE, "first"))
         self.assertEqual((second.action, second.rationale), (PolicyAction.RESUME, "second"))
+
+    async def test_noncooperative_sync_timeout_stays_tracked_and_rejects_accumulation(self):
+        started = threading.Event()
+        release = threading.Event()
+        published = []
+
+        class Runtime:
+            def __init__(self):
+                self.call_count = 0
+
+            def generate(self, prompt):
+                self.call_count += 1
+                if self.call_count == 1:
+                    started.set()
+                    release.wait(timeout=2.0)
+                    return '{"action":"ANSWER","confidence":1,"rationale":"late first"}'
+                return '{"action":"RESUME","confidence":1,"rationale":"next request"}'
+
+        runtime = Runtime()
+        engine = SemanticPolicyEngine(runtime, timeout_ms=20, on_decision=published.append)
+        heartbeat = asyncio.Event()
+
+        async def beat():
+            await asyncio.sleep(0.005)
+            heartbeat.set()
+
+        beat_task = asyncio.create_task(beat())
+        first = await engine.decide(request_for("first"))
+        await beat_task
+
+        self.assertTrue(started.is_set())
+        self.assertTrue(heartbeat.is_set())
+        self.assertTrue(engine.inflight)
+        self.assertEqual(first.rationale, "policy timeout")
+
+        busy = await asyncio.gather(
+            *(engine.decide(request_for(f"busy-{index}")) for index in range(8))
+        )
+        self.assertEqual(runtime.call_count, 1)
+        self.assertTrue(all(item.action is PolicyAction.UNCERTAIN for item in busy))
+        self.assertTrue(all(item.rationale == "policy busy" for item in busy))
+
+        release.set()
+        for _ in range(100):
+            if not engine.inflight:
+                break
+            await asyncio.sleep(0.005)
+        self.assertFalse(engine.inflight)
+
+        next_decision = await engine.decide(request_for("next"))
+        self.assertEqual(runtime.call_count, 2)
+        self.assertEqual(next_decision.action, PolicyAction.RESUME)
+        self.assertNotIn(PolicyAction.ANSWER, [item.action for item in published])
 
 
 class QwenPolicyProviderTests(unittest.IsolatedAsyncioTestCase):
@@ -330,6 +455,7 @@ class PolicyBenchmarkTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--placement", result.stdout)
         self.assertIn("--quantization", result.stdout)
         self.assertIn("--prompt-case", result.stdout)
 
@@ -340,6 +466,54 @@ class PolicyBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["p50_ms"], 250.0)
         self.assertEqual(summary["p95_ms"], 385.0)
         self.assertFalse(summary["meets_300ms_gate"])
+
+    def test_multiple_placements_are_reported_and_only_passing_fastest_is_selected(self):
+        from scripts.benchmark_policy_llm import analyze_placements, parse_placements
+
+        placements = parse_placements(["cuda:none", "cpu:8bit", "cuda:4bit"])
+        report = analyze_placements(
+            placements,
+            {
+                "cuda:none": [250.0, 290.0, 310.0],
+                "cpu:8bit": [320.0, 350.0, 400.0],
+                "cuda:4bit": [120.0, 140.0, 160.0],
+            },
+            gate_ms=300.0,
+        )
+
+        self.assertEqual(
+            [(item.device, item.quantization) for item in placements],
+            [("cuda", "none"), ("cpu", "8bit"), ("cuda", "4bit")],
+        )
+        self.assertEqual(set(report["placements"]), {"cuda:none", "cpu:8bit", "cuda:4bit"})
+        self.assertFalse(report["placements"]["cuda:none"]["meets_gate"])
+        self.assertFalse(report["placements"]["cpu:8bit"]["meets_gate"])
+        self.assertTrue(report["placements"]["cuda:4bit"]["meets_gate"])
+        self.assertEqual(report["selected_placement"], "cuda:4bit")
+
+    def test_no_placement_is_selected_when_all_fail_gate(self):
+        from scripts.benchmark_policy_llm import analyze_placements, parse_placements
+
+        placements = parse_placements(["cuda:none", "cpu:none"])
+        report = analyze_placements(
+            placements,
+            {"cuda:none": [301.0], "cpu:none": [450.0]},
+            gate_ms=300.0,
+        )
+
+        self.assertIsNone(report["selected_placement"])
+
+    def test_representative_benchmark_prompt_uses_full_policy_request(self):
+        from scripts.benchmark_policy_llm import representative_policy_prompt
+
+        payload = json.loads(representative_policy_prompt("revise"))
+
+        self.assertEqual(payload["state"]["response"], "DUCKED")
+        self.assertEqual(payload["state"]["assistant_act"], "STATEMENT")
+        self.assertEqual(payload["user_transcript"]["revision_id"], 7)
+        self.assertEqual(payload["candidate"]["label"], "turn_end")
+        self.assertEqual(payload["task_checkpoint"], {"city": "上海", "step": 2})
+        self.assertEqual(payload["policy_contract"]["allowed_actions"][0], "BACKCHANNEL")
 
 
 if __name__ == "__main__":

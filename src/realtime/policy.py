@@ -76,6 +76,17 @@ class PolicyDecision:
             value = getattr(self, name)
             if value is not None and not isinstance(value, str):
                 raise TypeError(f"{name} must be a string or None")
+        if action is PolicyAction.MODE_SWITCH:
+            if self.intent not in {"chat", "continuous_interpretation"}:
+                raise ValueError(
+                    "MODE_SWITCH intent must be 'chat' or 'continuous_interpretation'"
+                )
+            if self.intent == "continuous_interpretation" and (
+                self.target_language is None or not self.target_language.strip()
+            ):
+                raise ValueError(
+                    "continuous_interpretation requires a nonempty target_language"
+                )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "PolicyDecision":
@@ -176,6 +187,8 @@ class PolicyRequest:
                 "strict_json_only": True,
                 "required_fields": ["action", "confidence", "rationale"],
                 "optional_fields": ["intent", "source_language", "target_language"],
+                "mode_switch_intents": ["chat", "continuous_interpretation"],
+                "continuous_interpretation_requires": ["target_language"],
                 "guidance": (
                     "Classify semantic intent using conversation context. A brief acknowledgement "
                     "during an assistant statement is BACKCHANNEL, but an answer to an assistant "
@@ -233,16 +246,26 @@ class SemanticPolicyEngine:
         self.timeout_seconds = timeout_ms / 1000.0
         self.confidence_threshold = float(confidence_threshold)
         self.on_decision = on_decision
+        self._inflight_task: asyncio.Task[Any] | None = None
+        self._inflight_lock = asyncio.Lock()
+
+    @property
+    def inflight(self) -> bool:
+        """Whether one provider generation is still consuming resources."""
+        task = self._inflight_task
+        return task is not None and not task.done()
 
     async def decide(self, request: PolicyRequest) -> PolicyDecision:
         if not isinstance(request, PolicyRequest):
             raise TypeError("request must be PolicyRequest")
-        task = asyncio.create_task(self._generate(request.to_prompt_json()))
-        task.add_done_callback(_consume_task_result)
+        task = await self._start_generation(request.to_prompt_json())
+        if task is None:
+            decision = _uncertain("policy busy")
+            await self._publish(decision)
+            return decision
         try:
             raw = await asyncio.wait_for(asyncio.shield(task), timeout=self.timeout_seconds)
         except asyncio.TimeoutError:
-            task.cancel()
             decision = _uncertain("policy timeout")
         except Exception:
             decision = _uncertain("policy runtime failure")
@@ -255,6 +278,24 @@ class SemanticPolicyEngine:
                 decision = _uncertain("policy output rejected")
         await self._publish(decision)
         return decision
+
+    async def _start_generation(self, prompt: str) -> asyncio.Task[Any] | None:
+        async with self._inflight_lock:
+            current = self._inflight_task
+            if current is not None and not current.done():
+                return None
+            self._inflight_task = asyncio.create_task(self._generate(prompt))
+            task = self._inflight_task
+            loop = asyncio.get_running_loop()
+            task.add_done_callback(
+                lambda finished: _schedule_inflight_cleanup(loop, self, finished)
+            )
+            return task
+
+    async def _clear_inflight(self, task: asyncio.Task[Any]) -> None:
+        async with self._inflight_lock:
+            if self._inflight_task is task:
+                self._inflight_task = None
 
     async def _generate(self, prompt: str) -> Any:
         method = self.provider.generate
@@ -293,3 +334,15 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
         task.exception()
     except (asyncio.CancelledError, Exception):
         return
+
+
+def _schedule_inflight_cleanup(
+    loop: asyncio.AbstractEventLoop,
+    engine: SemanticPolicyEngine,
+    task: asyncio.Task[Any],
+) -> None:
+    _consume_task_result(task)
+    if loop.is_closed():
+        return
+    cleanup = loop.create_task(engine._clear_inflight(task))
+    cleanup.add_done_callback(_consume_task_result)

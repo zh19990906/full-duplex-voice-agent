@@ -60,13 +60,21 @@ class ConversationControllerV1Tests(unittest.TestCase):
         self.assertEqual([item.action_type for item in actions], [ActionType.DUCK_RESPONSE])
         self.assertEqual((state.floor, state.response), (FloorState.OVERLAP, ResponseState.DUCKED))
 
-    def test_candidate_interrupt_pauses_without_cancelling_or_processing(self):
+    def test_candidate_speech_start_ducks_without_cancelling_or_processing(self):
         state = SessionState(ConversationMode.CHAT, FloorState.ASSISTANT, ResponseState.PLAYING)
         actions = ConversationController().handle_candidate(
             state, candidate("USER_SPEECH_START_CANDIDATE", "speaking")
         )
+        self.assertEqual([item.action_type for item in actions], [ActionType.DUCK_RESPONSE])
+        self.assertEqual((state.floor, state.response), (FloorState.OVERLAP, ResponseState.DUCKED))
+
+    def test_candidate_turn_end_may_pause_ducked_playback(self):
+        state = SessionState(ConversationMode.CHAT, FloorState.OVERLAP, ResponseState.DUCKED)
+        actions = ConversationController().handle_candidate(
+            state, candidate("USER_TURN_END_CANDIDATE", "turn_end")
+        )
         self.assertEqual([item.action_type for item in actions], [ActionType.PAUSE_RESPONSE])
-        self.assertEqual((state.floor, state.response), (FloorState.OVERLAP, ResponseState.PAUSED))
+        self.assertEqual(state.response, ResponseState.PAUSED)
 
     def test_affirmation_after_question_is_answer_not_backchannel(self):
         controller = ConversationController()
@@ -93,6 +101,64 @@ class ConversationControllerV1Tests(unittest.TestCase):
             [ActionType.RESTORE_RESPONSE, ActionType.CONTINUE_GENERATION],
         )
         self.assertEqual((state.floor, state.response), (FloorState.ASSISTANT, ResponseState.PLAYING))
+
+    def test_backchannel_resumes_tentatively_paused_response_and_continues(self):
+        state = SessionState(ConversationMode.CHAT, FloorState.OVERLAP, ResponseState.PAUSED)
+        actions = ConversationController().apply_policy(state, decision(PolicyAction.BACKCHANNEL))
+        self.assertEqual(
+            [item.action_type for item in actions],
+            [ActionType.RESUME_RESPONSE, ActionType.CONTINUE_GENERATION],
+        )
+        self.assertEqual((state.floor, state.response), (FloorState.ASSISTANT, ResponseState.PLAYING))
+
+    def test_speech_candidate_then_backchannel_policy_restores_playback(self):
+        controller = ConversationController()
+        state = SessionState(ConversationMode.CHAT, FloorState.ASSISTANT, ResponseState.PLAYING)
+
+        tentative = controller.handle_candidate(
+            state, candidate("USER_SPEECH_START_CANDIDATE", "speaking")
+        )
+        committed = controller.apply_policy(state, decision(PolicyAction.BACKCHANNEL))
+
+        self.assertEqual([item.action_type for item in tentative], [ActionType.DUCK_RESPONSE])
+        self.assertEqual(
+            [item.action_type for item in committed],
+            [ActionType.RESTORE_RESPONSE, ActionType.CONTINUE_GENERATION],
+        )
+        self.assertEqual(state.response, ResponseState.PLAYING)
+
+    def test_turn_end_candidate_then_backchannel_policy_resumes_playback(self):
+        controller = ConversationController()
+        state = SessionState(ConversationMode.CHAT, FloorState.ASSISTANT, ResponseState.PLAYING)
+
+        tentative = controller.handle_candidate(
+            state, candidate("USER_TURN_END_CANDIDATE", "turn_end")
+        )
+        committed = controller.apply_policy(state, decision(PolicyAction.BACKCHANNEL))
+
+        self.assertEqual([item.action_type for item in tentative], [ActionType.PAUSE_RESPONSE])
+        self.assertEqual(
+            [item.action_type for item in committed],
+            [ActionType.RESUME_RESPONSE, ActionType.CONTINUE_GENERATION],
+        )
+        self.assertEqual(state.response, ResponseState.PLAYING)
+
+    def test_speech_candidate_then_answer_keeps_exact_answer_actions(self):
+        controller = ConversationController()
+        state = SessionState(
+            ConversationMode.CHAT,
+            FloorState.ASSISTANT,
+            ResponseState.PLAYING,
+            "ASKING",
+        )
+
+        controller.handle_candidate(state, candidate("USER_SPEECH_START_CANDIDATE", "speaking"))
+        actions = controller.apply_policy(state, decision(PolicyAction.ANSWER))
+
+        self.assertEqual(
+            [item.action_type for item in actions],
+            [ActionType.STOP_RESPONSE, ActionType.PROCESS_USER_REQUEST],
+        )
 
     def test_pause_preserves_response_without_new_request(self):
         state = SessionState(ConversationMode.CHAT, FloorState.OVERLAP, ResponseState.PLAYING)
@@ -173,6 +239,20 @@ class ConversationControllerV1Tests(unittest.TestCase):
         )
         self.assertEqual(state.mode, ConversationMode.CHAT)
         self.assertEqual(dict(actions[0].payload)["target_mode"], "CHAT")
+
+    def test_controller_rejects_corrupted_mode_switch_instead_of_defaulting(self):
+        state = SessionState(ConversationMode.CHAT, FloorState.USER, ResponseState.IDLE)
+        policy = decision(
+            PolicyAction.MODE_SWITCH,
+            intent="continuous_interpretation",
+            target_language="English",
+        )
+        object.__setattr__(policy, "intent", "one_shot_translation")
+
+        with self.assertRaises(ValueError):
+            ConversationController().apply_policy(state, policy)
+
+        self.assertEqual(state.mode, ConversationMode.CHAT)
 
     def test_uncertain_pauses_and_requests_clarification_never_continues(self):
         state = SessionState(ConversationMode.CHAT, FloorState.OVERLAP, ResponseState.DUCKED)

@@ -55,16 +55,17 @@ class ConversationController:
             raise TypeError("state must be SessionState")
         if not isinstance(candidate, SpeechCandidateEvent):
             raise TypeError("candidate must be SpeechCandidateEvent")
-        if state.response is not ResponseState.PLAYING:
+        if state.response not in {ResponseState.PLAYING, ResponseState.DUCKED}:
             return ()
-        state.floor = FloorState.OVERLAP
-        if candidate.event == "USER_BACKCHANNEL_CANDIDATE":
+        if candidate.event in {
+            "USER_BACKCHANNEL_CANDIDATE",
+            "USER_SPEECH_START_CANDIDATE",
+        } and state.response is ResponseState.PLAYING:
+            state.floor = FloorState.OVERLAP
             state.response = ResponseState.DUCKED
             return (ControllerAction(ActionType.DUCK_RESPONSE),)
-        if candidate.event in {
-            "USER_SPEECH_START_CANDIDATE",
-            "USER_TURN_END_CANDIDATE",
-        }:
+        if candidate.event == "USER_TURN_END_CANDIDATE":
+            state.floor = FloorState.OVERLAP
             state.response = ResponseState.PAUSED
             return (ControllerAction(ActionType.PAUSE_RESPONSE),)
         return ()
@@ -84,6 +85,9 @@ class ConversationController:
             actions = []
             if state.response is ResponseState.DUCKED:
                 actions.append(ControllerAction(ActionType.RESTORE_RESPONSE))
+                state.response = ResponseState.PLAYING
+            elif state.response is ResponseState.PAUSED:
+                actions.append(ControllerAction(ActionType.RESUME_RESPONSE))
                 state.response = ResponseState.PLAYING
             actions.append(ControllerAction(ActionType.CONTINUE_GENERATION))
             state.floor = FloorState.ASSISTANT
@@ -127,11 +131,12 @@ class ConversationController:
             )
 
         if policy.action is PolicyAction.MODE_SWITCH:
-            target_mode = (
-                ConversationMode.CHAT
-                if policy.intent == "chat"
-                else ConversationMode.INTERPRETATION
-            )
+            if policy.intent == "chat":
+                target_mode = ConversationMode.CHAT
+            elif policy.intent == "continuous_interpretation":
+                target_mode = ConversationMode.INTERPRETATION
+            else:
+                raise ValueError("unsupported MODE_SWITCH intent")
             state.mode = target_mode
             return (
                 ControllerAction(
