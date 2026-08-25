@@ -1,7 +1,9 @@
-"""Dataclass-based realtime event contracts."""
+"""Dataclass-based event contracts, including the V1 realtime envelope."""
 
 from dataclasses import dataclass
 from typing import Any, ClassVar
+
+from src.realtime.protocol import RealtimeEnvelope
 
 
 @dataclass(frozen=True)
