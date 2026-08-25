@@ -3,13 +3,25 @@
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
+
+from src.realtime.cancellation import CancellationToken
 
 from .priority import Priority
 
 
 RuntimeTask = Callable[[], Awaitable[Any]] | Awaitable[Any]
-_QueueItem = tuple[float, int, RuntimeTask | None]
+
+
+@dataclass(frozen=True)
+class _ScheduledTask:
+    task: RuntimeTask
+    deadline: float
+    cancellation_token: CancellationToken
+
+
+_QueueItem = tuple[float, int, _ScheduledTask | None]
 
 
 class RealtimeScheduler:
@@ -29,7 +41,14 @@ class RealtimeScheduler:
         self._shutdown_requested = False
         self._errors: list[BaseException] = []
 
-    async def submit(self, task: RuntimeTask, priority: Priority) -> None:
+    async def submit(
+        self,
+        task: RuntimeTask,
+        priority: Priority,
+        *,
+        deadline: float | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> None:
         """Queue one async task for execution at ``priority``.
 
         ``task`` may be an async callable or an already-created awaitable.
@@ -42,7 +61,15 @@ class RealtimeScheduler:
         if not callable(task) and not inspect.isawaitable(task):
             raise TypeError("task must be an async callable or awaitable")
 
-        self._queue.put_nowait((-priority.value, self._sequence, task))
+        if deadline is None:
+            deadline = float("inf")
+        if cancellation_token is None:
+            cancellation_token = CancellationToken()
+        if not isinstance(cancellation_token, CancellationToken):
+            raise TypeError("cancellation_token must be a CancellationToken value")
+
+        scheduled_task = _ScheduledTask(task, deadline, cancellation_token)
+        self._queue.put_nowait((-priority.value, self._sequence, scheduled_task))
         self._sequence += 1
         if self._worker_task is None:
             self._worker_task = asyncio.create_task(self._run())
@@ -65,10 +92,17 @@ class RealtimeScheduler:
 
     async def _run(self) -> None:
         while True:
-            _, _, task = await self._queue.get()
+            _, _, scheduled_task = await self._queue.get()
             try:
-                if task is None:
+                if scheduled_task is None:
                     return
+                if (
+                    scheduled_task.cancellation_token.is_cancelled()
+                    or asyncio.get_running_loop().time() >= scheduled_task.deadline
+                ):
+                    self._discard(scheduled_task.task)
+                    continue
+                task = scheduled_task.task
                 result = task() if callable(task) else task
                 await result
             except asyncio.CancelledError:
@@ -77,6 +111,12 @@ class RealtimeScheduler:
                 self._errors.append(error)
             finally:
                 self._queue.task_done()
+
+    @staticmethod
+    def _discard(task: RuntimeTask) -> None:
+        """Close unstarted coroutine objects skipped while queued."""
+        if inspect.iscoroutine(task):
+            task.close()
 
 
 Scheduler = RealtimeScheduler
