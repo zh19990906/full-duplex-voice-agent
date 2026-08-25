@@ -199,6 +199,11 @@ class SpeechEventFusion:
         self._turn_open = True
         self._turn_inactive = False
         self.latest_transcript = None
+        self._speech_latched = False
+        self._turn_end_latched = False
+        self._speaking_count = 0
+        self._idle_count = 0
+        self._turn_end_count = 0
 
     def _start_speech_turn(self) -> None:
         if self._turn_inactive:
