@@ -28,6 +28,7 @@ class ApiEventSerializer:
         elif isinstance(value, AudioChunk):
             event_name = "audio_chunk"
             payload = value.to_dict()
+            payload.setdefault("sample_rate", 24000)
         elif isinstance(value, AgentState):
             event_name = "agent_state"
             payload = value.to_dict()

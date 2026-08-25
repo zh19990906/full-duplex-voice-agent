@@ -66,6 +66,25 @@ python scripts/test_real_stack.py \
   --output /tmp/real_stack_response.wav
 ```
 
+To serve the real text-to-speech path and the browser console on the mapped
+port `8001`:
+
+```bash
+python -m pip install fastapi uvicorn
+
+python scripts/run_real_server.py \
+  --llm-model /mnt/model-zhangheng/Qwen2.5-14B-Instruct \
+  --tts-model /mnt/model-zhangheng/Fun-CosyVoice3-0.5B-2512 \
+  --prompt-audio /home/X2-Turn/turn-demo/assets/sample_en.wav \
+  --prompt-text 'hello can you tell me what the weather is like today<|endofprompt|>' \
+  --port 8001
+```
+
+Open `http://服务器地址:8001`. This browser path currently supports text input
+through the real Qwen and CosyVoice models. Binary microphone messages return a
+clear notice because the checked-in X2-Turn local API performs offline whole-file
+inference rather than streaming raw browser audio.
+
 ## High Level Architecture
 
 ```

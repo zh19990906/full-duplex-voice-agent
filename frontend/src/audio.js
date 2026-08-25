@@ -31,13 +31,20 @@ export class BrowserAudioOutput {
     this.nextStart = 0;
   }
 
-  async playBase64(audioData) {
+  async playBase64(audioData, sampleRate = 24000) {
     if (!audioData) return;
     this.context ||= new AudioContext();
     const binary = atob(audioData);
-    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-    // Browser-native decoding is the transport boundary; the UI does not inspect codecs.
-    const buffer = await this.context.decodeAudioData(bytes.buffer);
+    const pcm = new Int16Array(binary.length / 2);
+    for (let index = 0; index < pcm.length; index += 1) {
+      const low = binary.charCodeAt(index * 2);
+      const high = binary.charCodeAt(index * 2 + 1);
+      const value = (high << 8) | low;
+      pcm[index] = value & 0x8000 ? value - 0x10000 : value;
+    }
+    const buffer = this.context.createBuffer(1, pcm.length, sampleRate);
+    const channel = buffer.getChannelData(0);
+    for (let index = 0; index < pcm.length; index += 1) channel[index] = pcm[index] / 32768;
     const source = this.context.createBufferSource();
     source.buffer = buffer;
     source.connect(this.context.destination);

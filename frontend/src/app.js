@@ -26,7 +26,10 @@ export function bootResearchConsole(documentRef = document) {
       const envelope = event.detail;
       timeline.add(envelope);
       if (type === "token" || type === "transcript") appendChat(type, envelope.payload?.text || "");
-      if (type === "audio") audioOutput.playBase64(envelope.payload?.audio_data).catch(console.error);
+      if (type === "audio") audioOutput.playBase64(
+        envelope.payload?.audio_data,
+        envelope.payload?.sample_rate || 24000,
+      ).catch(console.error);
       if (type === "agent_state") byId("agent-state").textContent = JSON.stringify(envelope.payload, null, 2);
       if (type === "tool_call" || type === "tool_result") byId("tool-output").textContent = JSON.stringify(envelope.payload, null, 2);
     }));
