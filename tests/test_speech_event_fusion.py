@@ -209,6 +209,31 @@ class SpeechEventFusionTests(unittest.TestCase):
             ["USER_TURN_END_CANDIDATE"],
         )
 
+    def test_subthreshold_speaking_noise_keeps_closed_turn_end_latched_until_new_turn_confirms(self):
+        """Catches one speaking frame reopening a closed turn's end latch."""
+        fusion = SpeechEventFusion(speaking_frames=2, turn_end_frames=2)
+
+        fusion.accept_turn(TurnCandidate("turn_end", 0.9))
+        self.assertEqual(
+            [event.event for event in fusion.accept_turn(TurnCandidate("turn_end", 0.9))],
+            ["USER_TURN_END_CANDIDATE"],
+        )
+        self.assertEqual(fusion.accept_turn(TurnCandidate("speaking", 0.9)), ())
+        self.assertEqual(fusion.accept_turn(TurnCandidate("turn_end", 0.9)), ())
+        self.assertEqual(fusion.accept_turn(TurnCandidate("turn_end", 0.9)), ())
+
+        self.assertEqual(fusion.accept_turn(TurnCandidate("speaking", 0.9)), ())
+        self.assertEqual(
+            [event.event for event in fusion.accept_turn(TurnCandidate("speaking", 0.9))],
+            ["USER_SPEECH_START_CANDIDATE"],
+        )
+        self.assertEqual(fusion.accept_turn(TurnCandidate("turn_end", 0.9)), ())
+        self.assertEqual(
+            [event.event for event in fusion.accept_turn(TurnCandidate("turn_end", 0.9))],
+            ["USER_TURN_END_CANDIDATE"],
+        )
+        self.assertEqual(fusion.accept_turn(TurnCandidate("turn_end", 0.9)), ())
+
     def test_final_revision_and_context_remain_candidates_without_mutating_session_state(self):
         """Catches fusion changing policy state or emitting legacy semantic User* events."""
         state = SessionState(floor=FloorState.ASSISTANT, response=ResponseState.PLAYING)

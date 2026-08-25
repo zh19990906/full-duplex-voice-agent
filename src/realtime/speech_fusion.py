@@ -145,7 +145,6 @@ class SpeechEventFusion:
             self._speaking_count += 1
             self._idle_count = 0
             self._turn_end_count = 0
-            self._turn_end_latched = False
             if self._speaking_count >= self.speaking_frames and not self._speech_latched:
                 self._start_speech_turn()
                 self._speech_latched = True
