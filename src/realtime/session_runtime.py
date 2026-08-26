@@ -6,15 +6,22 @@ from dataclasses import dataclass
 import inspect
 from typing import Any
 
+from src.asr.stream import TranscriptChunk
 from src.controller.actions import ActionType, ControllerAction
-from src.realtime.interpretation import InterpretationSession
+from src.core.events.events import BaseEvent, UserSpeechPartialEvent, UserTurnEndEvent
+from src.realtime.interpretation import (
+    InterpretationPipeline,
+    InterpretationSession,
+    TranslationSegment,
+)
 from src.realtime.session_state import ConversationMode
 from src.realtime.text_segmenter import TextSegment
 from src.tts_runtime.stream import AudioChunk
 
 from .audio_ingress import AudioIngress
+from .cancellation import CancellationToken
 from .checkpoint import ResponseCheckpointStore, ResumePlan
-from .identifiers import GenerationClock
+from .identifiers import GenerationClock, IdentifierAllocator
 from .playback import PlaybackAck, PlaybackCoordinator
 
 
@@ -41,18 +48,25 @@ class RealtimeSessionRuntime:
         playback: PlaybackCoordinator | None = None,
         checkpoints: ResponseCheckpointStore | None = None,
         cancel_generation: CancelGenerationHook | None = None,
+        interpretation_translator: Any | None = None,
+        interpretation_sink: Any | None = None,
     ) -> None:
         if not session_id:
             raise ValueError("session_id must not be empty")
         self.session_id = session_id
         self.generation_clock = GenerationClock()
+        self._interpretation_response_ids = IdentifierAllocator()
         self.ingress = ingress if ingress is not None else AudioIngress()
         self.playback = playback if playback is not None else PlaybackCoordinator()
         self.checkpoints = checkpoints if checkpoints is not None else self.playback.checkpoint_store
         self.playback.set_checkpoint_store(self.checkpoints)
         self.cancel_generation = cancel_generation
+        self.interpretation_translator = interpretation_translator
+        self.interpretation_sink = interpretation_sink
         self.conversation_mode = ConversationMode.CHAT
         self.interpretation_session: InterpretationSession | None = None
+        self._interpretation_pipeline: InterpretationPipeline | None = None
+        self._interpretation_cancellation: CancellationToken | None = None
         self.current_response_id: str | None = None
         self._archived_response_ids: list[str] = []
         self._closed = False
@@ -128,6 +142,7 @@ class RealtimeSessionRuntime:
     def advance_generation(self) -> int:
         """Invalidate current response work and return the replacement epoch."""
         new_epoch = self.generation_clock.advance()
+        self._restart_interpretation_pipeline()
         if self.current_response_id is not None:
             self.playback.set_active_response(
                 self.current_response_id,
@@ -186,7 +201,30 @@ class RealtimeSessionRuntime:
             await self.ingress.close()
             return
         self._closed = True
+        self._clear_interpretation_pipeline(clear_session=True)
         await self.ingress.close()
+
+    async def accept_asr_event(self, event: BaseEvent) -> TranslationSegment | None:
+        """Consume ASR pipeline events through the live interpretation path."""
+        if not isinstance(event, BaseEvent):
+            raise TypeError("event must be BaseEvent")
+        if not isinstance(event, (UserSpeechPartialEvent, UserTurnEndEvent)):
+            return None
+        return await self.accept_transcript_chunk(self._chunk_from_event(event))
+
+    async def accept_transcript_chunk(
+        self,
+        chunk: TranscriptChunk,
+    ) -> TranslationSegment | None:
+        """Consume one revision-aware transcript chunk in interpretation mode."""
+        if not isinstance(chunk, TranscriptChunk):
+            raise TypeError("chunk must be TranscriptChunk")
+        if self.conversation_mode is not ConversationMode.INTERPRETATION:
+            return None
+        pipeline = self._interpretation_pipeline
+        if pipeline is None:
+            return None
+        return await pipeline.push_chunk(chunk)
 
     def _advance_for_current_response(self, *, archive: bool) -> int:
         response_id = self.current_response_id
@@ -212,14 +250,14 @@ class RealtimeSessionRuntime:
         target_mode = payload.get("target_mode")
         if target_mode == ConversationMode.CHAT.value:
             self.conversation_mode = ConversationMode.CHAT
-            self.interpretation_session = None
+            self._clear_interpretation_pipeline(clear_session=True)
             return
         if target_mode != ConversationMode.INTERPRETATION.value:
             raise ValueError("unsupported target_mode")
         target_language = payload.get("target_language")
         source_language = payload.get("source_language")
         if self.interpretation_session is None:
-            self.interpretation_session = InterpretationSession(
+            self._build_interpretation_pipeline(
                 target_language=target_language,
                 source_language=source_language,
             )
@@ -228,4 +266,77 @@ class RealtimeSessionRuntime:
                 target_language,
                 source_language=source_language,
             )
+            if self._interpretation_pipeline is not None:
+                self._interpretation_pipeline.set_target_language(
+                    target_language,
+                    source_language=source_language,
+                )
         self.conversation_mode = ConversationMode.INTERPRETATION
+
+    def _build_interpretation_pipeline(
+        self,
+        *,
+        target_language: str,
+        source_language: str | None,
+    ) -> None:
+        if self.interpretation_translator is None or self.interpretation_sink is None:
+            self.interpretation_session = InterpretationSession(
+                target_language=target_language,
+                source_language=source_language,
+                generation_clock=self.generation_clock,
+                response_id_factory=self._interpretation_response_ids.next_response_id,
+            )
+            self._interpretation_pipeline = None
+            self._interpretation_cancellation = None
+            self.activate_response(self.interpretation_session.response_id)
+            return
+        cancellation = CancellationToken()
+        pipeline = InterpretationPipeline(
+            translator=self.interpretation_translator,
+            sink=self.interpretation_sink,
+            target_language=target_language,
+            source_language=source_language,
+            cancellation_token=cancellation,
+            generation_clock=self.generation_clock,
+            response_id_factory=self._interpretation_response_ids.next_response_id,
+        )
+        self._interpretation_cancellation = cancellation
+        self._interpretation_pipeline = pipeline
+        self.interpretation_session = pipeline.session
+        self.activate_response(pipeline.session.response_id)
+
+    def _restart_interpretation_pipeline(self) -> None:
+        if self.conversation_mode is not ConversationMode.INTERPRETATION:
+            return
+        session = self.interpretation_session
+        if session is None:
+            return
+        target_language = session.target_language
+        source_language = session.source_language
+        self._clear_interpretation_pipeline(clear_session=False)
+        self._build_interpretation_pipeline(
+            target_language=target_language,
+            source_language=source_language,
+        )
+
+    def _clear_interpretation_pipeline(self, *, clear_session: bool) -> None:
+        if self._interpretation_cancellation is not None:
+            self._interpretation_cancellation.cancel()
+        self._interpretation_pipeline = None
+        self._interpretation_cancellation = None
+        if clear_session:
+            self.interpretation_session = None
+
+    @staticmethod
+    def _chunk_from_event(event: BaseEvent) -> TranscriptChunk:
+        payload = event.payload
+        return TranscriptChunk(
+            chunk_id=str(payload.get("chunk_id", event.event_id)),
+            text=str(payload.get("text", "")),
+            timestamp=float(event.timestamp),
+            is_final=isinstance(event, UserTurnEndEvent),
+            revision_id=int(payload.get("revision_id", 0)),
+            unstable_text=str(payload.get("unstable_text", "")),
+            committed_text=payload.get("committed_text"),
+            replaces_committed=bool(payload.get("replaces_committed", False)),
+        )
