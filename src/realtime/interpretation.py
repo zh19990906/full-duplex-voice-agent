@@ -223,11 +223,17 @@ class InterpretationSession:
         translation: TranslationSegment,
         *,
         affected_index: int | None = None,
+        activate_source: bool = True,
     ) -> None:
         self._next_source_segment_id += 1
         self._next_translation_segment_id += 1
         self.source_segments.append(source)
         self.translation_segments.append(translation)
+        if not activate_source:
+            if affected_index is None:
+                return
+            self._active_sources = self._active_sources[:affected_index]
+            return
         active = _ActiveSource(source, translation.translation_segment_id)
         if affected_index is None:
             self._active_sources.append(active)
@@ -304,6 +310,16 @@ class InterpretationPipeline:
         self._lock = asyncio.Lock()
         self._accepted_results: dict[tuple[Any, ...], TranslationSegment | None] = {}
         self._pending_publication: _PendingPublication | None = None
+        self._active_operation_task: asyncio.Task[Any] | None = None
+
+    def cancel(self) -> None:
+        """Cancel the active interpretation operation, if any."""
+        if self.cancellation_token is not None:
+            self.cancellation_token.cancel()
+        task = self._active_operation_task
+        current = asyncio.current_task()
+        if task is not None and task is not current and not task.done():
+            task.cancel()
 
     async def push_partial(
         self,
@@ -314,17 +330,27 @@ class InterpretationPipeline:
         if not isinstance(hypothesis, str):
             raise TypeError("hypothesis must be a string")
         async with self._lock:
-            await self._retry_pending_locked()
-            if not self._is_current():
-                return None
-            stable_text = (
-                self._committer.finalize(hypothesis)
-                if is_final
-                else self._committer.update(hypothesis)
-            )
-            if not stable_text or not self._is_current():
-                return None
-            return await self._publish_addition_locked(stable_text)
+            task = asyncio.current_task()
+            self._active_operation_task = task
+            try:
+                await self._retry_pending_locked()
+                if not self._is_current():
+                    return None
+                stable_text = (
+                    self._committer.finalize(hypothesis)
+                    if is_final
+                    else self._committer.update(hypothesis)
+                )
+                if not stable_text or not self._is_current():
+                    return None
+                return await self._publish_addition_locked(stable_text)
+            except asyncio.CancelledError:
+                if not self._is_current():
+                    return None
+                raise
+            finally:
+                if self._active_operation_task is task:
+                    self._active_operation_task = None
 
     async def push_chunk(self, chunk: TranscriptChunk) -> TranslationSegment | None:
         if not isinstance(chunk, TranscriptChunk):
@@ -338,17 +364,27 @@ class InterpretationPipeline:
             chunk.is_final,
         )
         async with self._lock:
-            await self._retry_pending_locked()
-            if signature in self._accepted_results:
-                return self._accepted_results[signature]
-            if not self._is_current():
-                return None
-            if chunk.replaces_committed:
-                return await self._publish_correction_locked(chunk, signature)
-            if not chunk.text:
-                self._accepted_results[signature] = None
-                return None
-            return await self._publish_addition_locked(chunk.text, signature=signature)
+            task = asyncio.current_task()
+            self._active_operation_task = task
+            try:
+                await self._retry_pending_locked()
+                if signature in self._accepted_results:
+                    return self._accepted_results[signature]
+                if not self._is_current():
+                    return None
+                if chunk.replaces_committed:
+                    return await self._publish_correction_locked(chunk, signature)
+                if not chunk.text:
+                    self._accepted_results[signature] = None
+                    return None
+                return await self._publish_addition_locked(chunk.text, signature=signature)
+            except asyncio.CancelledError:
+                if not self._is_current():
+                    return None
+                raise
+            finally:
+                if self._active_operation_task is task:
+                    self._active_operation_task = None
 
     def set_target_language(
         self,
@@ -398,15 +434,42 @@ class InterpretationPipeline:
         if not superseded and corrected_text == self.session.committed_source_text:
             self._accepted_results[signature] = None
             return None
-        replacement_text = corrected_text[boundary:]
-        if not replacement_text:
-            self.session.truncate_committed_state(affected_index)
-            self._accepted_results[signature] = None
-            return None
         any_started = any(
             self.session.translation_by_id(segment_id).playback_started
             for segment_id in superseded
         )
+        replacement_text = corrected_text[boundary:]
+        if not replacement_text:
+            if not any_started:
+                self.session.truncate_committed_state(affected_index)
+                self._accepted_results[signature] = None
+                return None
+            removed_text = self.session.committed_source_text[boundary:]
+            source_segment = self.session.preview_source_segment(
+                removed_text,
+                start_offset=boundary,
+            )
+            prompt = build_discard_correction_prompt(
+                source_segment.text,
+                target_language=source_segment.target_language,
+                source_language=source_segment.source_language,
+            )
+            translated_text = _translated_text(await self.translator.translate_stream(prompt))
+            if not self._is_current():
+                return None
+            translation_segment = self.session.preview_translation_segment(
+                source_segment,
+                translated_text,
+                kind="CORRECTION",
+                supersedes_translation_segment_ids=superseded,
+            )
+            return await self._publish_transactionally_locked(
+                signature,
+                source_segment,
+                translation_segment,
+                affected_index=affected_index,
+                activate_source=False,
+            )
         source_segment = self.session.preview_source_segment(
             replacement_text,
             start_offset=boundary,
@@ -448,6 +511,7 @@ class InterpretationPipeline:
         translation_segment: TranslationSegment,
         *,
         affected_index: int | None = None,
+        activate_source: bool = True,
     ) -> TranslationSegment | None:
         if not self._is_current():
             return None
@@ -459,10 +523,16 @@ class InterpretationPipeline:
         )
         try:
             await _publish(self.sink, translation_segment)
+        except asyncio.CancelledError:
+            if not self._is_current():
+                return None
+            raise
         except BaseException:
             self._pending_publication = pending
             raise
-        self._commit_publication(pending)
+        if not self._is_current():
+            return None
+        self._commit_publication(pending, activate_source=activate_source)
         return translation_segment
 
     async def _retry_pending_locked(self) -> None:
@@ -474,15 +544,29 @@ class InterpretationPipeline:
             return
         try:
             await _publish(self.sink, pending.translation_segment)
+        except asyncio.CancelledError:
+            if not self._is_current():
+                self._pending_publication = None
+                return
+            raise
         except BaseException:
             raise
+        if not self._is_current():
+            self._pending_publication = None
+            return
         self._commit_publication(pending)
 
-    def _commit_publication(self, pending: _PendingPublication) -> None:
+    def _commit_publication(
+        self,
+        pending: _PendingPublication,
+        *,
+        activate_source: bool = True,
+    ) -> None:
         self.session.commit_translation(
             pending.source_segment,
             pending.translation_segment,
             affected_index=pending.affected_index,
+            activate_source=activate_source,
         )
         if pending.signature:
             self._accepted_results[pending.signature] = pending.translation_segment
@@ -543,6 +627,29 @@ def build_correction_prompt(
     )
 
 
+def build_discard_correction_prompt(
+    source_text: str,
+    *,
+    target_language: str,
+    source_language: str | None = None,
+) -> str:
+    """Return a deterministic correction instruction for withdrawn source content."""
+    if not isinstance(source_text, str) or not source_text:
+        raise ValueError("source_text must be a nonempty string")
+    _require_language(target_language, "target_language")
+    if source_language is not None and not isinstance(source_language, str):
+        raise TypeError("source_language must be a string or None")
+    rendered_source_language = source_language.strip() if source_language else "auto-detect"
+    return (
+        "Task: Tell the listener in the target language to disregard the previous interpretation of withdrawn source content.\n"
+        f"Target language: {target_language.strip()}\n"
+        f"Source language: {rendered_source_language}\n"
+        "Return only the correction text.\n"
+        "Withdrawn source text:\n"
+        f"{source_text}"
+    )
+
+
 async def _publish(sink: TranslationSegmentSink, segment: TranslationSegment) -> None:
     result = sink.publish(segment)
     if inspect.isawaitable(result):
@@ -585,4 +692,5 @@ __all__ = [
     "TranslationSegmentSink",
     "build_translation_prompt",
     "build_correction_prompt",
+    "build_discard_correction_prompt",
 ]

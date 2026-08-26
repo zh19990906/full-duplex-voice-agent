@@ -320,6 +320,8 @@ class RealtimeSessionRuntime:
         )
 
     def _clear_interpretation_pipeline(self, *, clear_session: bool) -> None:
+        if self._interpretation_pipeline is not None:
+            self._interpretation_pipeline.cancel()
         if self._interpretation_cancellation is not None:
             self._interpretation_cancellation.cancel()
         self._interpretation_pipeline = None

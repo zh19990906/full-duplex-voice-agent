@@ -8,6 +8,8 @@ from src.realtime.identifiers import GenerationClock
 from src.realtime.interpretation import (
     InterpretationPipeline,
     TranslationSegment,
+    build_correction_prompt,
+    build_discard_correction_prompt,
     build_translation_prompt,
 )
 
@@ -300,6 +302,67 @@ class InterpretationRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [item.source_text for item in pipeline.session.translation_segments],
             ["去上海", "去北京"],
         )
+
+    async def test_authoritative_deletion_silently_removes_unplayed_translation(self):
+        translator = RecordingTranslator(["first"])
+        sink = RecordingTranslationSink()
+        pipeline = InterpretationPipeline(
+            translator=translator,
+            sink=sink,
+            target_language="English",
+        )
+
+        await pipeline.push_chunk(TranscriptChunk("chunk-1", "去上海", 1.0, False, revision_id=1))
+        deleted = await pipeline.push_chunk(
+            TranscriptChunk(
+                "chunk-2",
+                "",
+                2.0,
+                True,
+                revision_id=2,
+                committed_text="",
+                replaces_committed=True,
+            )
+        )
+
+        self.assertIsNone(deleted)
+        self.assertEqual([item.translated_text for item in sink.items], ["first"])
+        self.assertEqual(pipeline.session.committed_source_text, "")
+
+    async def test_authoritative_deletion_after_started_playback_appends_correction(self):
+        translator = RecordingTranslator(["first", "disregard that"])
+        sink = RecordingTranslationSink(mark_started_ids={0})
+        pipeline = InterpretationPipeline(
+            translator=translator,
+            sink=sink,
+            target_language="English",
+        )
+
+        await pipeline.push_chunk(TranscriptChunk("chunk-1", "去上海", 1.0, False, revision_id=1))
+        deleted = await pipeline.push_chunk(
+            TranscriptChunk(
+                "chunk-2",
+                "",
+                2.0,
+                True,
+                revision_id=2,
+                committed_text="",
+                replaces_committed=True,
+            )
+        )
+
+        self.assertEqual(
+            translator.prompts[-1],
+            build_discard_correction_prompt(
+                "去上海",
+                target_language="English",
+                source_language=None,
+            ),
+        )
+        self.assertEqual(deleted.translated_text, "disregard that")
+        self.assertEqual(deleted.kind, "CORRECTION")
+        self.assertEqual(deleted.supersedes_translation_segment_ids, (0,))
+        self.assertEqual(pipeline.session.committed_source_text, "")
 
     async def test_sink_failure_retries_same_segment_once_without_advancing_identity(self):
         translator = RecordingTranslator(["first"])
