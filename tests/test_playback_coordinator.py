@@ -1,5 +1,6 @@
 import unittest
 
+from src.api.events import ApiEventSerializer
 from src.controller.actions import ActionType, ControllerAction
 from src.realtime.checkpoint import ResponseCheckpointStore
 from src.realtime.playback import PlaybackAck, PlaybackCoordinator
@@ -59,7 +60,33 @@ class PlaybackCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.segment_id, 3)
         self.assertEqual(plan.sample_offset, 0)
         self.assertEqual(plan.audio, b"\x00\x00" * 6)
-        self.assertEqual(commands, ["RESUME"])
+        self.assertEqual(
+            commands,
+            [
+                {
+                    "event": "RESUME_RESPONSE",
+                    "payload": {
+                        "response_id": "response-2",
+                        "generation_epoch": 2,
+                        "playback_attempt_id": plan.playback_attempt_id,
+                    },
+                }
+            ],
+        )
+
+        serialized = ApiEventSerializer.serialize(commands[0], "session-2")
+        self.assertEqual(
+            serialized,
+            {
+                "event": "RESUME_RESPONSE",
+                "payload": {
+                    "response_id": "response-2",
+                    "generation_epoch": 2,
+                    "playback_attempt_id": plan.playback_attempt_id,
+                },
+                "session_id": "session-2",
+            },
+        )
 
     async def test_resume_rejects_delayed_ack_from_old_playback_attempt(self):
         commands = []

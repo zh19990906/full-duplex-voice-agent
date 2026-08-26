@@ -94,7 +94,20 @@ class RealBackchannelResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(effect.resume_plan.segment_id, 0)
         self.assertEqual(effect.resume_plan.sample_offset, 0)
         self.assertEqual(effect.resume_plan.audio, b"\x00\x00" * 6)
-        self.assertEqual(commands, ["PAUSE", "RESUME"])
+        self.assertEqual(
+            commands,
+            [
+                "PAUSE",
+                {
+                    "event": "RESUME_RESPONSE",
+                    "payload": {
+                        "response_id": "response-2",
+                        "generation_epoch": 0,
+                        "playback_attempt_id": effect.resume_plan.playback_attempt_id,
+                    },
+                },
+            ],
+        )
 
     async def test_revise_advances_epoch_discards_unplayed_audio_and_new_request_archives_old_response(self):
         commands = []

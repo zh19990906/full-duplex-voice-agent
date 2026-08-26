@@ -5,13 +5,14 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from src.controller.actions import ActionType, ControllerAction
 
 from .checkpoint import ResponseCheckpointStore, ResumePlan
 
 
-CommandSender = Callable[[str], Awaitable[None] | None]
+CommandSender = Callable[[Any], Awaitable[None] | None]
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,16 @@ class PlaybackCoordinator:
                     text=plan.text,
                     playback_attempt_id=self._active_playback_attempt_id,
                 )
-            await self._emit("RESUME")
+            await self._emit(
+                {
+                    "event": "RESUME_RESPONSE",
+                    "payload": {
+                        "response_id": self._active_response_id,
+                        "generation_epoch": self._active_generation_epoch,
+                        "playback_attempt_id": self._active_playback_attempt_id,
+                    },
+                }
+            )
             return plan
         if action.action_type is ActionType.STOP_RESPONSE:
             await self._emit("STOP")
@@ -115,7 +125,7 @@ class PlaybackCoordinator:
         self._next_playback_attempt_id += 1
         return self._next_playback_attempt_id
 
-    async def _emit(self, command: str) -> None:
+    async def _emit(self, command: Any) -> None:
         result = self._send_command(command)
         if inspect.isawaitable(result):
             await result

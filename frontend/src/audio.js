@@ -174,7 +174,7 @@ export class PlaybackQueue {
 
   pauseResponse(responseId) {
     const matches = (item) => item.response_id === responseId;
-    const paused = [...this.pending.filter(matches), ...this.active.filter(matches)];
+    const paused = [...this.active.filter(matches), ...this.pending.filter(matches)];
     this.pending = this.pending.filter((item) => !matches(item));
     this.active = this.active.filter((item) => !matches(item));
     this.paused.push(...paused);
@@ -197,6 +197,20 @@ export class PlaybackQueue {
       .filter((value) => Number.isInteger(value));
     if (!attempts.length) return undefined;
     return Math.max(...attempts);
+  }
+
+  resumeResponse(responseId, epoch, playbackAttemptId) {
+    const resumed = [];
+    const retained = [];
+    for (const item of this.paused) {
+      if (matchesWithoutAttempt(item, responseId, epoch, item.segment_id)) {
+        resumed.push({ ...item, playback_attempt_id: playbackAttemptId });
+      } else {
+        retained.push(item);
+      }
+    }
+    this.paused = retained;
+    return resumed;
   }
 
   complete(responseId, epoch, segmentId, playbackAttemptId = undefined) {
@@ -277,6 +291,19 @@ export class BrowserPlaybackCoordinator {
     if (stopped.length && this.workletNode) this.workletNode.port.postMessage({ type: "stop_response", response_id: responseId });
     if (stopped.length && !this.workletNode) this.#acknowledgePendingTerminal("stopped", stopped);
     return stopped.length > 0;
+  }
+
+  resumeResponse(payload) {
+    const responseId = payload?.response_id ?? payload?.responseId;
+    const generationEpoch = payload?.generation_epoch ?? payload?.generationEpoch;
+    const playbackAttemptId = payload?.playback_attempt_id ?? payload?.playbackAttemptId;
+    if (!responseId || !Number.isInteger(generationEpoch) || !Number.isInteger(playbackAttemptId)) return false;
+    const resumed = this.queue.resumeResponse(responseId, generationEpoch, playbackAttemptId);
+    for (const item of resumed) {
+      this.queue.enqueue(item);
+      if (this.workletNode) this.#sendItem(item);
+    }
+    return resumed.length > 0;
   }
 
   close() {
@@ -409,7 +436,7 @@ export class BrowserPlaybackCoordinator {
       acknowledgement.playback_attempt_id = event.playback_attempt_id;
     }
     this.onPlaybackAck(acknowledgement);
-    if (["completed", "stopped", "paused"].includes(event.type)) {
+    if (["completed", "stopped"].includes(event.type)) {
       this.queue.complete(
         event.response_id,
         event.generation_epoch,

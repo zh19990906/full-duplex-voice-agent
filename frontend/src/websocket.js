@@ -8,6 +8,7 @@ export const EVENT_TYPES = Object.freeze([
   "duck",
   "restore",
   "pause_response",
+  "resume_response",
   "stop_response",
   "set_epoch",
 ]);

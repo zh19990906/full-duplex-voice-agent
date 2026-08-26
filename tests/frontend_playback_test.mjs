@@ -120,6 +120,57 @@ test("coordinator pauses only the named response and leaves unrelated output que
   assert.equal(context.closeCalls, 0);
 });
 
+test("coordinator resumes paused partial and tail segments in order under one fresh attempt", () => {
+  const { coordinator, port, acknowledgements } = createCoordinator();
+  const segment = (segment_id, samples) => ({
+    response_id: "r1",
+    generation_epoch: 4,
+    segment_id,
+    playback_attempt_id: 1,
+    pcm16: new Int16Array(samples),
+    sample_rate: 24000,
+    channels: 1,
+  });
+
+  coordinator.setEpoch(4);
+  coordinator.enqueue(segment(0, [10, 11]));
+  coordinator.enqueue(segment(1, [20, 21]));
+  coordinator.enqueue(segment(2, [30, 31]));
+  coordinator.pauseResponse("r1");
+
+  port.emit({ type: "paused", response_id: "r1", generation_epoch: 4, segment_id: 0, playback_attempt_id: 1, sample_offset: 1, audio_time: 9 });
+  port.emit({ type: "paused", response_id: "r1", generation_epoch: 4, segment_id: 1, playback_attempt_id: 1, sample_offset: 0, audio_time: 9 });
+  port.emit({ type: "paused", response_id: "r1", generation_epoch: 4, segment_id: 2, playback_attempt_id: 1, sample_offset: 0, audio_time: 9 });
+
+  assert.deepEqual(coordinator.queue.paused.map(({ segment_id }) => segment_id), [0, 1, 2]);
+
+  acknowledgements.length = 0;
+  coordinator.resumeResponse({ response_id: "r1", generation_epoch: 4, playback_attempt_id: 2 });
+
+  assert.deepEqual(port.messages.slice(-3).map((message) => [
+    message.type,
+    message.item?.segment_id,
+    message.item?.playback_attempt_id,
+  ]), [
+    ["enqueue", 0, 2],
+    ["enqueue", 1, 2],
+    ["enqueue", 2, 2],
+  ]);
+
+  port.emit({ type: "completed", response_id: "r1", generation_epoch: 4, segment_id: 0, playback_attempt_id: 1, sample_offset: 2, audio_time: 10.0 });
+  port.emit({ type: "completed", response_id: "r1", generation_epoch: 4, segment_id: 0, playback_attempt_id: 2, sample_offset: 2, audio_time: 10.1 });
+  port.emit({ type: "completed", response_id: "r1", generation_epoch: 4, segment_id: 1, playback_attempt_id: 2, sample_offset: 2, audio_time: 10.2 });
+  port.emit({ type: "completed", response_id: "r1", generation_epoch: 4, segment_id: 2, playback_attempt_id: 2, sample_offset: 2, audio_time: 10.3 });
+
+  assert.deepEqual(acknowledgements, [
+    { response_id: "r1", generation_epoch: 4, segment_id: 0, playback_attempt_id: 2, sample_offset: 2, audio_time: 10.1 },
+    { response_id: "r1", generation_epoch: 4, segment_id: 1, playback_attempt_id: 2, sample_offset: 2, audio_time: 10.2 },
+    { response_id: "r1", generation_epoch: 4, segment_id: 2, playback_attempt_id: 2, sample_offset: 2, audio_time: 10.3 },
+  ]);
+  assert.deepEqual(coordinator.queue.active, []);
+  assert.deepEqual(coordinator.queue.paused, []);
+});
+
 test("coordinator forwards a newer epoch to the worklet after purging stale active output", () => {
   const { coordinator, port } = createCoordinator();
   coordinator.setEpoch(4);
@@ -477,6 +528,7 @@ test("app routes identity-aware audio and playback controls without closing new 
     unlock: async () => calls.push(["unlock"]), close: async () => calls.push(["close"]),
     enqueue: (value) => calls.push(["enqueue", value]), duck: () => calls.push(["duck"]),
     restore: () => calls.push(["restore"]), pauseResponse: (value) => calls.push(["pause", value]),
+    resumeResponse: (value) => calls.push(["resume", value]),
     stopResponse: (value) => calls.push(["stop", value]), setEpoch: (value) => calls.push(["epoch", value]),
   };
 
@@ -498,19 +550,22 @@ test("app routes identity-aware audio and playback controls without closing new 
     for (const event of [
       { event: "DUCK" }, { event: "RESTORE" },
       { event: "PAUSE_RESPONSE", payload: { response_id: "pause-me" } },
+      { event: "RESUME_RESPONSE", payload: { response_id: "pause-me", generation_epoch: 8, playback_attempt_id: 12 } },
       { event: "STOP_RESPONSE", response_id: "stop-me" },
       { event: "SET_EPOCH", payload: { generation_epoch: 11 } },
     ]) FakeSocket.current.emit("message", { data: JSON.stringify(event) });
-    playbackOptions.onPlaybackAck({ response_id: "root-response", generation_epoch: 8, segment_id: 9, sample_offset: 2, audio_time: 1.5 });
+    playbackOptions.onPlaybackAck({ response_id: "root-response", generation_epoch: 8, segment_id: 9, playback_attempt_id: 12, sample_offset: 2, audio_time: 1.5 });
 
-    assert.deepEqual(calls.slice(0, 7), [
+    assert.deepEqual(calls.slice(0, 8), [
       ["unlock"],
       ["enqueue", { response_id: "root-response", generation_epoch: 8, segment_id: 9, audio_data: "AAABAA==", sample_rate: 24000, channels: 1 }],
-      ["duck"], ["restore"], ["pause", "pause-me"], ["stop", "stop-me"], ["epoch", 11],
+      ["duck"], ["restore"], ["pause", "pause-me"],
+      ["resume", { response_id: "pause-me", generation_epoch: 8, playback_attempt_id: 12 }],
+      ["stop", "stop-me"], ["epoch", 11],
     ]);
     assert.deepEqual(FakeSocket.current.sent.map(JSON.parse), [{
       type: "playback_ack",
-      payload: { response_id: "root-response", generation_epoch: 8, segment_id: 9, sample_offset: 2, audio_time: 1.5 },
+      payload: { response_id: "root-response", generation_epoch: 8, segment_id: 9, playback_attempt_id: 12, sample_offset: 2, audio_time: 1.5 },
     }]);
     await elements.get("close-session").trigger("click");
     assert.equal(state.socket, null);

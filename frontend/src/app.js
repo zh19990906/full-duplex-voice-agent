@@ -98,6 +98,7 @@ export function bootResearchConsole(
       if (type === "duck") playback.duck();
       if (type === "restore") playback.restore();
       if (type === "pause_response") playback.pauseResponse(eventField(envelope, "response_id"));
+      if (type === "resume_response") playback.resumeResponse(envelope.payload ?? envelope);
       if (type === "stop_response") playback.stopResponse(eventField(envelope, "response_id"));
       if (type === "set_epoch") playback.setEpoch(eventField(envelope, "generation_epoch", 0));
       if (type === "agent_state") byId("agent-state").textContent = JSON.stringify(envelope.payload, null, 2);
