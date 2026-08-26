@@ -15,6 +15,7 @@ class ResumePlan:
     sample_offset: int
     audio: bytes
     text: str = ""
+    playback_attempt_id: int | None = None
 
 
 @dataclass
@@ -85,14 +86,11 @@ class ResponseCheckpointStore:
         if text:
             segment.text = text
         if audio:
-            segment.audio = audio
+            segment.audio += audio
+            checkpoint.synthesized_cursor += len(audio) // 2
         checkpoint.committed_cursor = max(
             checkpoint.committed_cursor,
             sum(len(item.text) for item in checkpoint.segments.values()),
-        )
-        checkpoint.synthesized_cursor = max(
-            checkpoint.synthesized_cursor,
-            sum(item.sample_count for item in checkpoint.segments.values()),
         )
 
     def ack(self, response_id: str, *, segment_id: int, sample_offset: int) -> None:

@@ -61,6 +61,55 @@ class PlaybackCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.audio, b"\x00\x00" * 6)
         self.assertEqual(commands, ["RESUME"])
 
+    async def test_resume_rejects_delayed_ack_from_old_playback_attempt(self):
+        commands = []
+        store = ResponseCheckpointStore()
+        store.activate("response-3", generation_epoch=2)
+        store.record_segment("response-3", 3, "继续说完这一句。", audio=b"\x00\x00" * 6)
+        playback = PlaybackCoordinator(send_command=commands.append, checkpoint_store=store)
+        playback.set_active_response("response-3", generation_epoch=2)
+        first_attempt = playback.active_playback_attempt_id
+
+        await playback.apply(ControllerAction(ActionType.PAUSE_RESPONSE))
+        plan = await playback.apply(ControllerAction(ActionType.RESUME_RESPONSE))
+
+        stale_attempt = playback.ack(
+            PlaybackAck(
+                response_id="response-3",
+                generation_epoch=2,
+                segment_id=3,
+                sample_offset=4,
+                audio_time=1.0,
+                playback_attempt_id=first_attempt,
+            )
+        )
+        missing_attempt = playback.ack(
+            PlaybackAck(
+                response_id="response-3",
+                generation_epoch=2,
+                segment_id=3,
+                sample_offset=4,
+                audio_time=1.1,
+            )
+        )
+        accepted = playback.ack(
+            PlaybackAck(
+                response_id="response-3",
+                generation_epoch=2,
+                segment_id=3,
+                sample_offset=5,
+                audio_time=1.2,
+                playback_attempt_id=plan.playback_attempt_id,
+            )
+        )
+
+        checkpoint = store.get("response-3")
+        self.assertFalse(stale_attempt)
+        self.assertFalse(missing_attempt)
+        self.assertTrue(accepted)
+        self.assertEqual(checkpoint.played_cursor, 5)
+        self.assertEqual(plan.playback_attempt_id, first_attempt + 1)
+
 
 if __name__ == "__main__":
     unittest.main()

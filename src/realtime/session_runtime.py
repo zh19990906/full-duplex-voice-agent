@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
+from typing import Any
 
 from src.controller.actions import ActionType, ControllerAction
 from src.realtime.text_segmenter import TextSegment
@@ -12,6 +14,9 @@ from .audio_ingress import AudioIngress
 from .checkpoint import ResponseCheckpointStore, ResumePlan
 from .identifiers import GenerationClock
 from .playback import PlaybackAck, PlaybackCoordinator
+
+
+CancelGenerationHook = Any
 
 
 @dataclass
@@ -33,6 +38,7 @@ class RealtimeSessionRuntime:
         ingress: AudioIngress | None = None,
         playback: PlaybackCoordinator | None = None,
         checkpoints: ResponseCheckpointStore | None = None,
+        cancel_generation: CancelGenerationHook | None = None,
     ) -> None:
         if not session_id:
             raise ValueError("session_id must not be empty")
@@ -42,6 +48,7 @@ class RealtimeSessionRuntime:
         self.playback = playback if playback is not None else PlaybackCoordinator()
         self.checkpoints = checkpoints if checkpoints is not None else self.playback.checkpoint_store
         self.playback.set_checkpoint_store(self.checkpoints)
+        self.cancel_generation = cancel_generation
         self.current_response_id: str | None = None
         self._archived_response_ids: list[str] = []
         self._closed = False
@@ -101,6 +108,7 @@ class RealtimeSessionRuntime:
         segment_id: int,
         sample_offset: int,
         audio_time: float = 0.0,
+        playback_attempt_id: int | None = None,
     ) -> bool:
         return self.playback.ack(
             PlaybackAck(
@@ -109,6 +117,7 @@ class RealtimeSessionRuntime:
                 segment_id=segment_id,
                 sample_offset=sample_offset,
                 audio_time=audio_time,
+                playback_attempt_id=playback_attempt_id,
             )
         )
 
@@ -143,6 +152,9 @@ class RealtimeSessionRuntime:
             if action.action_type is ActionType.REVISE_RESPONSE:
                 effect.advanced_epoch = self._advance_for_current_response(archive=False)
                 revise_requested = True
+                continue
+            if action.action_type is ActionType.CANCEL_GENERATION:
+                await self._cancel_current_generation()
                 continue
             if action.action_type is ActionType.PROCESS_USER_REQUEST:
                 if not revise_requested and self.current_response_id is not None:
@@ -180,3 +192,10 @@ class RealtimeSessionRuntime:
         else:
             self.checkpoints.discard_unplayed(response_id)
         return new_epoch
+
+    async def _cancel_current_generation(self) -> None:
+        if self.cancel_generation is None:
+            return
+        result = self.cancel_generation(self.current_response_id, self.generation_epoch)
+        if inspect.isawaitable(result):
+            await result

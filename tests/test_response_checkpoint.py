@@ -43,6 +43,21 @@ class ResponseCheckpointStoreTests(unittest.TestCase):
         self.assertEqual(plan.segment_id, 4)
         self.assertEqual(plan.sample_offset, 0)
 
+    def test_pause_resume_preserves_audio_appended_in_multiple_chunks_for_one_segment(self):
+        store = ResponseCheckpointStore()
+        store.activate("response-2", generation_epoch=1)
+
+        store.record_segment("response-2", 0, "先说这一句。", audio=b"\x01\x00" * 2)
+        store.record_segment("response-2", 0, "先说这一句。", audio=b"\x02\x00" * 3)
+
+        checkpoint = store.pause("response-2")
+        plan = store.resume("response-2")
+
+        self.assertEqual(checkpoint.synthesized_cursor, 5)
+        self.assertEqual(plan.audio, (b"\x01\x00" * 2) + (b"\x02\x00" * 3))
+        self.assertEqual(plan.segment_id, 0)
+        self.assertEqual(plan.sample_offset, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

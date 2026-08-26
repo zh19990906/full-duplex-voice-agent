@@ -88,6 +88,9 @@ export function bootResearchConsole(
         response_id: eventField(envelope, "response_id"),
         generation_epoch: eventField(envelope, "generation_epoch", 0),
         segment_id: eventField(envelope, "segment_id"),
+        ...(eventField(envelope, "playback_attempt_id") !== undefined
+          ? { playback_attempt_id: eventField(envelope, "playback_attempt_id") }
+          : {}),
         audio_data: eventField(envelope, "audio_data"),
         sample_rate: eventField(envelope, "sample_rate", 24000),
         channels: eventField(envelope, "channels", 1),

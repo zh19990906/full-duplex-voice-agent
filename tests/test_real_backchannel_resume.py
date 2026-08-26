@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from src.controller.actions import ActionType, ControllerAction
@@ -188,6 +189,62 @@ class RealBackchannelResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_request.archived_response_id, "response-4")
         self.assertEqual(runtime.archived_response_ids, ("response-4",))
         self.assertEqual(commands, ["STOP", "STOP"])
+
+    async def test_cancel_generation_awaits_async_hook_before_new_request_effects(self):
+        commands = []
+        cancel_started = asyncio.Event()
+        release_cancel = asyncio.Event()
+        calls = []
+
+        async def cancel_generation(response_id, generation_epoch):
+            calls.append((response_id, generation_epoch))
+            cancel_started.set()
+            await release_cancel.wait()
+
+        runtime = RealtimeSessionRuntime(
+            "session-4",
+            playback=PlaybackCoordinator(send_command=commands.append),
+            cancel_generation=cancel_generation,
+        )
+        runtime.activate_response("response-5")
+
+        task = asyncio.create_task(
+            runtime.apply_controller_actions(
+                (
+                    ControllerAction(ActionType.STOP_RESPONSE),
+                    ControllerAction(ActionType.CANCEL_GENERATION),
+                    ControllerAction(ActionType.PROCESS_USER_REQUEST),
+                )
+            )
+        )
+
+        await asyncio.wait_for(cancel_started.wait(), 0.1)
+        self.assertFalse(task.done())
+
+        release_cancel.set()
+        effect = await asyncio.wait_for(task, 0.1)
+
+        self.assertEqual(calls, [("response-5", 0)])
+        self.assertEqual(effect.archived_response_id, "response-5")
+        self.assertEqual(effect.advanced_epoch, 1)
+        self.assertEqual(commands, ["STOP"])
+
+    async def test_cancel_generation_supports_sync_hook(self):
+        calls = []
+
+        def cancel_generation(response_id, generation_epoch):
+            calls.append((response_id, generation_epoch))
+
+        runtime = RealtimeSessionRuntime(
+            "session-5",
+            playback=PlaybackCoordinator(),
+            cancel_generation=cancel_generation,
+        )
+        runtime.activate_response("response-6")
+
+        await runtime.apply_controller_actions((ControllerAction(ActionType.CANCEL_GENERATION),))
+
+        self.assertEqual(calls, [("response-6", 0)])
 
 
 if __name__ == "__main__":

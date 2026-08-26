@@ -117,7 +117,19 @@ const asInt16 = (audio) => {
   return pcm;
 };
 
-const identityMatches = (item, responseId, epoch, segmentId) => (
+const attemptMatches = (item, playbackAttemptId) => {
+  if (item.playback_attempt_id === undefined && playbackAttemptId === undefined) return true;
+  return item.playback_attempt_id === playbackAttemptId;
+};
+
+const identityMatches = (item, responseId, epoch, segmentId, playbackAttemptId = undefined) => (
+  item.response_id === responseId
+  && item.generation_epoch === epoch
+  && item.segment_id === segmentId
+  && attemptMatches(item, playbackAttemptId)
+);
+
+const matchesWithoutAttempt = (item, responseId, epoch, segmentId) => (
   item.response_id === responseId
   && item.generation_epoch === epoch
   && item.segment_id === segmentId
@@ -153,8 +165,8 @@ export class PlaybackQueue {
     return true;
   }
 
-  markActive(responseId, epoch, segmentId) {
-    const index = this.pending.findIndex((item) => identityMatches(item, responseId, epoch, segmentId));
+  markActive(responseId, epoch, segmentId, playbackAttemptId = undefined) {
+    const index = this.pending.findIndex((item) => identityMatches(item, responseId, epoch, segmentId, playbackAttemptId));
     if (index < 0) return false;
     this.active.push(this.pending.splice(index, 1)[0]);
     return true;
@@ -178,8 +190,17 @@ export class PlaybackQueue {
     return stopped;
   }
 
-  complete(responseId, epoch, segmentId) {
-    const matches = (item) => identityMatches(item, responseId, epoch, segmentId);
+  latestAttemptId(responseId, epoch, segmentId) {
+    const attempts = [...this.pending, ...this.active, ...this.paused]
+      .filter((item) => matchesWithoutAttempt(item, responseId, epoch, segmentId))
+      .map((item) => item.playback_attempt_id)
+      .filter((value) => Number.isInteger(value));
+    if (!attempts.length) return undefined;
+    return Math.max(...attempts);
+  }
+
+  complete(responseId, epoch, segmentId, playbackAttemptId = undefined) {
+    const matches = (item) => identityMatches(item, responseId, epoch, segmentId, playbackAttemptId);
     this.pending = this.pending.filter((item) => !matches(item));
     this.active = this.active.filter((item) => !matches(item));
     this.paused = this.paused.filter((item) => !matches(item));
@@ -298,10 +319,13 @@ export class BrowserPlaybackCoordinator {
       ? (payload.generation_epoch ?? payload.epoch) : 0;
     const segment_id = Number.isInteger(payload?.segment_id ?? payload?.segmentId)
       ? (payload.segment_id ?? payload.segmentId) : this.nextLegacySegmentId++;
+    const playback_attempt_id = Number.isInteger(payload?.playback_attempt_id ?? payload?.playbackAttemptId)
+      ? (payload.playback_attempt_id ?? payload.playbackAttemptId) : undefined;
     return {
       response_id: payload?.response_id ?? payload?.responseId ?? "legacy-response",
       generation_epoch,
       segment_id,
+      playback_attempt_id,
       pcm16,
       sample_rate,
       channels: 1,
@@ -347,7 +371,7 @@ export class BrowserPlaybackCoordinator {
   }
 
   #sendItem(item) {
-    if (!this.queue.markActive(item.response_id, item.generation_epoch, item.segment_id)) return;
+    if (!this.queue.markActive(item.response_id, item.generation_epoch, item.segment_id, item.playback_attempt_id)) return;
     this.workletNode.port.postMessage({
       type: "enqueue",
       item: { ...item, pcm16: item.pcm16.buffer },
@@ -358,7 +382,15 @@ export class BrowserPlaybackCoordinator {
     if (token !== this.lifecycleGeneration || worklet !== this.workletNode) return;
     if (!event || event.generation_epoch < this.queue.currentEpoch) return;
     if (!["progress", "completed", "stopped", "paused"].includes(event.type)) return;
-    const key = `${event.response_id}\u0000${event.generation_epoch}\u0000${event.segment_id}`;
+    const latestAttemptId = this.queue.latestAttemptId(
+      event.response_id,
+      event.generation_epoch,
+      event.segment_id,
+    );
+    if (latestAttemptId !== undefined) {
+      if (!Number.isInteger(event.playback_attempt_id) || event.playback_attempt_id !== latestAttemptId) return;
+    }
+    const key = `${event.response_id}\u0000${event.generation_epoch}\u0000${event.segment_id}\u0000${event.playback_attempt_id ?? ""}`;
     if (event.type === "progress") {
       const previous = this.progressAcks.get(key);
       if (previous !== undefined && event.audio_time - previous < 0.05) return;
@@ -373,9 +405,17 @@ export class BrowserPlaybackCoordinator {
       sample_offset: Math.floor(event.sample_offset),
       audio_time: event.audio_time,
     };
+    if (event.playback_attempt_id !== undefined) {
+      acknowledgement.playback_attempt_id = event.playback_attempt_id;
+    }
     this.onPlaybackAck(acknowledgement);
     if (["completed", "stopped", "paused"].includes(event.type)) {
-      this.queue.complete(event.response_id, event.generation_epoch, event.segment_id);
+      this.queue.complete(
+        event.response_id,
+        event.generation_epoch,
+        event.segment_id,
+        event.playback_attempt_id,
+      );
     }
   }
 
@@ -386,10 +426,11 @@ export class BrowserPlaybackCoordinator {
         response_id: item.response_id,
         generation_epoch: item.generation_epoch,
         segment_id: item.segment_id,
+        ...(item.playback_attempt_id !== undefined ? { playback_attempt_id: item.playback_attempt_id } : {}),
         sample_offset: 0,
         audio_time,
       });
-      this.queue.complete(item.response_id, item.generation_epoch, item.segment_id);
+      this.queue.complete(item.response_id, item.generation_epoch, item.segment_id, item.playback_attempt_id);
     }
   }
 

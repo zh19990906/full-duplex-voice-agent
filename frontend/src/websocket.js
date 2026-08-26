@@ -54,6 +54,9 @@ export class AgentWebSocket extends EventTarget {
       sample_offset: payload.sample_offset,
       audio_time: payload.audio_time,
     };
+    if (payload.playback_attempt_id !== undefined) {
+      acknowledgement.playback_attempt_id = payload.playback_attempt_id;
+    }
     return this.#sendJson({ type: "playback_ack", payload: acknowledgement });
   }
 

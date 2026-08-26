@@ -160,6 +160,22 @@ test("coordinator emits exact playback ACK payloads for progress and terminal st
   assert.equal(coordinator.queue.active.length, 0);
 });
 
+test("coordinator rejects delayed acknowledgements from an earlier playback attempt", () => {
+  const { coordinator, port, acknowledgements } = createCoordinator();
+  coordinator.setEpoch(4);
+  coordinator.enqueue({ ...item("r1", 4, 7), playback_attempt_id: 1 });
+  coordinator.pauseResponse("r1");
+  coordinator.enqueue({ ...item("r1", 4, 7), playback_attempt_id: 2 });
+
+  port.emit({ type: "progress", response_id: "r1", generation_epoch: 4, segment_id: 7, playback_attempt_id: 1, sample_offset: 2, audio_time: 10.125 });
+  port.emit({ type: "progress", response_id: "r1", generation_epoch: 4, segment_id: 7, sample_offset: 3, audio_time: 10.150 });
+  port.emit({ type: "progress", response_id: "r1", generation_epoch: 4, segment_id: 7, playback_attempt_id: 2, sample_offset: 4, audio_time: 10.200 });
+
+  assert.deepEqual(acknowledgements, [
+    { response_id: "r1", generation_epoch: 4, segment_id: 7, playback_attempt_id: 2, sample_offset: 4, audio_time: 10.2 },
+  ]);
+});
+
 test("coordinator decodes base64 PCM16 and forwards the source sample rate to the used worklet", () => {
   const { coordinator, port } = createCoordinator();
   coordinator.setEpoch(1);
@@ -425,7 +441,7 @@ test("websocket sends only the exact playback ACK payload while open", () => {
   const socket = { readyState: 0, send: (message) => sent.push(message) };
   const client = new AgentWebSocket("ws://example.test/ws");
   client.socket = socket;
-  const acknowledgement = { response_id: "r1", generation_epoch: 3, segment_id: 4, sample_offset: 22, audio_time: 8.5 };
+  const acknowledgement = { response_id: "r1", generation_epoch: 3, segment_id: 4, playback_attempt_id: 6, sample_offset: 22, audio_time: 8.5 };
 
   assert.equal(client.sendPlaybackAck(acknowledgement), false);
   socket.readyState = 1;

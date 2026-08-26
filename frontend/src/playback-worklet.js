@@ -76,14 +76,16 @@ export class PlaybackRenderer {
   }
 
   #emit(type, item, audioTime) {
-    this.onEvent({
+    const event = {
       type,
       response_id: item.response_id,
       generation_epoch: item.generation_epoch,
       segment_id: item.segment_id,
       sample_offset: Math.min(item.pcm16.length, Math.floor(item.position)),
       audio_time: audioTime,
-    });
+    };
+    if (item.playback_attempt_id !== undefined) event.playback_attempt_id = item.playback_attempt_id;
+    this.onEvent(event);
   }
 }
 
