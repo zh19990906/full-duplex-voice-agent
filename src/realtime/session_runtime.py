@@ -7,6 +7,8 @@ import inspect
 from typing import Any
 
 from src.controller.actions import ActionType, ControllerAction
+from src.realtime.interpretation import InterpretationSession
+from src.realtime.session_state import ConversationMode
 from src.realtime.text_segmenter import TextSegment
 from src.tts_runtime.stream import AudioChunk
 
@@ -49,6 +51,8 @@ class RealtimeSessionRuntime:
         self.checkpoints = checkpoints if checkpoints is not None else self.playback.checkpoint_store
         self.playback.set_checkpoint_store(self.checkpoints)
         self.cancel_generation = cancel_generation
+        self.conversation_mode = ConversationMode.CHAT
+        self.interpretation_session: InterpretationSession | None = None
         self.current_response_id: str | None = None
         self._archived_response_ids: list[str] = []
         self._closed = False
@@ -156,6 +160,9 @@ class RealtimeSessionRuntime:
             if action.action_type is ActionType.CANCEL_GENERATION:
                 await self._cancel_current_generation()
                 continue
+            if action.action_type is ActionType.SWITCH_MODE:
+                self._apply_mode_switch(action)
+                continue
             if action.action_type is ActionType.PROCESS_USER_REQUEST:
                 if not revise_requested and self.current_response_id is not None:
                     effect.archived_response_id = self.current_response_id
@@ -199,3 +206,26 @@ class RealtimeSessionRuntime:
         result = self.cancel_generation(self.current_response_id, self.generation_epoch)
         if inspect.isawaitable(result):
             await result
+
+    def _apply_mode_switch(self, action: ControllerAction) -> None:
+        payload = dict(action.payload or {})
+        target_mode = payload.get("target_mode")
+        if target_mode == ConversationMode.CHAT.value:
+            self.conversation_mode = ConversationMode.CHAT
+            self.interpretation_session = None
+            return
+        if target_mode != ConversationMode.INTERPRETATION.value:
+            raise ValueError("unsupported target_mode")
+        target_language = payload.get("target_language")
+        source_language = payload.get("source_language")
+        if self.interpretation_session is None:
+            self.interpretation_session = InterpretationSession(
+                target_language=target_language,
+                source_language=source_language,
+            )
+        else:
+            self.interpretation_session.set_target_language(
+                target_language,
+                source_language=source_language,
+            )
+        self.conversation_mode = ConversationMode.INTERPRETATION
