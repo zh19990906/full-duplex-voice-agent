@@ -1,5 +1,6 @@
 export const EVENT_TYPES = Object.freeze([
   "transcript",
+  "translation",
   "token",
   "audio",
   "tool_call",

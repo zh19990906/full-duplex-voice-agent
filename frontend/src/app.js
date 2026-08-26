@@ -84,6 +84,7 @@ export function bootResearchConsole(
       timeline.add(envelope);
       if (type === "token") assistantMessage.append(envelope.payload?.text || "");
       if (type === "transcript") appendChat(type, envelope.payload?.text || "");
+      if (type === "translation") appendChat("assistant", envelope.payload?.translated_text || "");
       if (type === "audio") playback.enqueue({
         response_id: eventField(envelope, "response_id"),
         generation_epoch: eventField(envelope, "generation_epoch", 0),

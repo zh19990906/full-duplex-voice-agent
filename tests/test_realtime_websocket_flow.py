@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from src.realtime.protocol import AudioFrameHeader, encode_audio_frame
 from src.runtime_app.bootstrap import RealtimeServerSettings, build_realtime_app
+from src.runtime_app.container import SlowConsumerError
 
 
 class _FakeFastAPI:
@@ -137,6 +138,22 @@ class RecordingRealtimeRuntime:
         self.closed = True
 
 
+class SlowConsumerRuntime(RecordingRealtimeRuntime):
+    async def accept_command(self, command):
+        self.commands.append(command)
+        self._events.extend(
+            [
+                {"event": "token", "payload": {"text": "first"}},
+                {"event": "token", "payload": {"text": "second"}},
+            ]
+        )
+
+    async def events(self):
+        if self._events:
+            yield self._events.pop(0)
+        raise SlowConsumerError("slow consumer")
+
+
 def _fake_fastapi_modules():
     fastapi = types.ModuleType("fastapi")
     fastapi.FastAPI = _FakeFastAPI
@@ -251,6 +268,26 @@ class RealtimeWebSocketFlowTests(unittest.TestCase):
         self.assertEqual(runtime.commands[1]["type"], "resume_response")
         self.assertEqual(websocket.sent[0]["event"], "RESUME_RESPONSE")
         self.assertEqual(websocket.sent[0]["payload"]["playback_attempt_id"], 7)
+
+    def test_slow_consumer_shutdown_closes_websocket_and_runtime_session(self):
+        runtime = SlowConsumerRuntime()
+        app = self._create_app(runtime)
+        create_session = app.http_endpoints[("POST", "/sessions")]
+        websocket_endpoint = app.websocket_endpoints["/ws/{session_id}"]
+        session_id = asyncio.run(create_session()).body["session_id"]
+        websocket = _FakeWebSocket(
+            f"/ws/{session_id}",
+            messages=[{"text": '{"type":"text","text":"hello"}'}],
+        )
+
+        asyncio.run(websocket_endpoint(websocket, session_id))
+
+        self.assertEqual(runtime.connected, 1)
+        self.assertEqual(runtime.disconnected, 1)
+        self.assertTrue(runtime.closed)
+        self.assertIsNotNone(websocket.closed)
+        self.assertEqual(websocket.closed["reason"], "slow consumer")
+        self.assertNotIn(session_id, app.state.sessions)
 
 
 if __name__ == "__main__":

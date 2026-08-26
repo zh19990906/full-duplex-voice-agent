@@ -20,7 +20,7 @@ from src.realtime.audio_ingress import RealtimeAudioFrame
 from src.realtime.protocol import decode_audio_frame
 from src.api.events import ApiEventSerializer
 
-from .container import ApplicationContainer
+from .container import ApplicationContainer, SlowConsumerError
 
 
 def create_application(
@@ -156,6 +156,7 @@ def build_realtime_app(
 
         await _maybe_call(runtime, "connect")
         sender = asyncio.create_task(_forward_runtime_events(runtime, websocket, resolved_session_id))
+        sender_failure: BaseException | None = None
         try:
             while True:
                 try:
@@ -165,6 +166,11 @@ def build_realtime_app(
                 try:
                     await _handle_socket_message(runtime, message)
                     if sender.done():
+                        try:
+                            await sender
+                        except SlowConsumerError as exc:
+                            sender_failure = exc
+                            break
                         sender = asyncio.create_task(
                             _forward_runtime_events(runtime, websocket, resolved_session_id)
                         )
@@ -174,12 +180,28 @@ def build_realtime_app(
                         {"event": "error", "payload": {"message": str(exc)}}
                     )
         finally:
-            sender.cancel()
+            if sender.done():
+                try:
+                    await sender
+                except SlowConsumerError as exc:
+                    sender_failure = exc
+                except asyncio.CancelledError:
+                    pass
+            else:
+                sender.cancel()
+                try:
+                    await sender
+                except asyncio.CancelledError:
+                    pass
+            if isinstance(sender_failure, SlowConsumerError):
+                sessions.pop(resolved_session_id or "", None)
+                await _safe_close_runtime(runtime)
+                await websocket.close(code=1011, reason="slow consumer")
             try:
-                await sender
-            except asyncio.CancelledError:
-                pass
-            await _maybe_call(runtime, "disconnect")
+                await _maybe_call(runtime, "disconnect")
+            finally:
+                if isinstance(sender_failure, SlowConsumerError):
+                    return
 
     @app.websocket("/ws/{session_id}")
     async def websocket_session_endpoint(websocket: WebSocket, session_id: str):

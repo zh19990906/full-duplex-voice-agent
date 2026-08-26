@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 import inspect
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -20,7 +21,9 @@ from src.realtime.cancellation import ActiveTaskSlot, CancellationToken
 from src.realtime.playback import PlaybackCoordinator
 from src.realtime.policy import PolicyRequest, SemanticPolicyEngine
 from src.realtime.response_pipeline import RealtimeResponsePipeline, ResponseStreamEnd
+from src.realtime.interpretation import TranslationSegment
 from src.realtime.session_runtime import RealtimeSessionRuntime
+from src.realtime.session_state import ConversationMode
 from src.realtime.session_state import FloorState, ResponseState, SessionState
 from src.realtime.speech_fusion import SpeechEventFusion
 from src.realtime.text_segmenter import LanguageAwareTextSegmenter, TextSegment
@@ -87,6 +90,168 @@ class ApplicationContainer:
 _EVENT_STREAM_STOP = object()
 
 
+class SlowConsumerError(RuntimeError):
+    """Raised when a bounded outbound event queue cannot keep up."""
+
+
+class QwenTranslationAdapter:
+    """Adapt a Qwen-compatible local runtime to the translation contract."""
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        runtime: Any,
+        device: str = "cuda",
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not model_path:
+            raise ValueError("translation model_path must be supplied")
+        if runtime is None:
+            raise ValueError("translation runtime must be supplied")
+        self.model_path = model_path
+        self.runtime = runtime
+        self.device = device
+        self.options = dict(options or {})
+
+    async def translate_stream(self, prompt: str) -> str:
+        if not isinstance(prompt, str):
+            raise TypeError("prompt must be a string")
+        method = getattr(self.runtime, "translate_stream", None)
+        if callable(method):
+            result = method(prompt, **self.options)
+        else:
+            method = getattr(self.runtime, "generate", None)
+            if not callable(method):
+                raise RuntimeError("translation runtime must expose translate_stream() or generate()")
+            result = method(prompt, **self.options)
+        if inspect.isawaitable(result):
+            result = await result
+        if hasattr(result, "__aiter__"):
+            parts = []
+            async for item in result:
+                parts.append(_coerce_text(item))
+            return "".join(parts)
+        if isinstance(result, (list, tuple)):
+            return "".join(_coerce_text(item) for item in result)
+        return _coerce_text(result)
+
+
+class RuntimeBackedTranslationSink:
+    """Route accepted interpretation translations through runtime playback/events."""
+
+    def __init__(self, runtime: "ServerRealtimeSessionRuntime") -> None:
+        self.runtime = runtime
+
+    async def publish(self, segment: TranslationSegment) -> None:
+        if self.runtime.closed:
+            return
+        segment.playback_started = True
+        text_segment = TextSegment(
+            segment.translation_segment_id,
+            segment.translated_text,
+            False,
+            segment.response_id,
+            segment.generation_epoch,
+        )
+        self.runtime.record_response_segment(text_segment)
+        self.runtime.session_state.response = ResponseState.PLAYING
+        self.runtime.session_state.floor = FloorState.ASSISTANT
+        await self.runtime._publish(
+            {
+                "event": "translation",
+                "response_id": segment.response_id,
+                "generation_epoch": segment.generation_epoch,
+                "segment_id": segment.translation_segment_id,
+                "payload": asdict(segment),
+            }
+        )
+        request_id = self.runtime._tts_request_id(text_segment)
+        stream = await self.runtime._start_tts_stream(text_segment, request_id)
+        async for raw_chunk in _iterate_maybe_async(stream):
+            chunk = self.runtime._tag_audio(
+                raw_chunk,
+                text_segment,
+                request_id,
+                self.runtime.playback.active_playback_attempt_id,
+            )
+            self.runtime.record_audio_chunk(chunk)
+            await self.runtime._publish_audio_chunk(chunk)
+
+
+class _SharedRuntimeBoundary:
+    """Serialize access to one shared heavyweight runtime object."""
+
+    def __init__(self, runtime: Any) -> None:
+        self.runtime = runtime
+        self._lock = asyncio.Lock()
+
+    async def call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        async with self._lock:
+            method = getattr(self.runtime, method_name, None)
+            if not callable(method):
+                raise RuntimeError(f"shared runtime must expose {method_name}()")
+            result = method(*args, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+    async def iterate(self, method_name: str, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        async with self._lock:
+            method = getattr(self.runtime, method_name, None)
+            if not callable(method):
+                raise RuntimeError(f"shared runtime must expose {method_name}()")
+            result = method(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            async for item in _iterate_maybe_async(result):
+                yield item
+
+    async def close(self) -> None:
+        close = getattr(self.runtime, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+
+
+class _SessionRuntimeProxy:
+    """Per-session façade around one serialized heavyweight runtime boundary."""
+
+    def __init__(self, boundary: _SharedRuntimeBoundary) -> None:
+        self.runtime = boundary
+
+    async def transcribe(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.runtime.call("transcribe", *args, **kwargs)
+
+    async def infer(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.runtime.call("infer", *args, **kwargs)
+
+    async def generate(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.runtime.call("generate", *args, **kwargs)
+
+    async def translate_stream(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.runtime.call("generate", *args, **kwargs)
+
+    async def stream_tokens(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        async for item in self.runtime.iterate("stream_tokens", *args, **kwargs):
+            yield item
+
+    async def stream_audio(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        async for item in self.runtime.iterate("stream_audio", *args, **kwargs):
+            yield item
+
+    async def cancel(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def interrupt(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def reset(self) -> None:
+        return None
+
+
 class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
     """Per-session realtime runtime that owns command, audio, and event flow."""
 
@@ -99,36 +264,50 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         asr: Any | None = None,
         turn: Any | None = None,
         policy_engine: SemanticPolicyEngine | None = None,
+        interpretation_translator: Any | None = None,
+        interpretation_sink: Any | None = None,
         controller: ConversationController | None = None,
         fusion: SpeechEventFusion | None = None,
         prompt_builder: Callable[[str], str] | None = None,
         segmenter: LanguageAwareTextSegmenter | None = None,
         tts_queue_capacity: int = 2,
+        outbound_event_queue_capacity: int = 64,
+        audio_output_sample_rate: int = 24000,
+        audio_output_channels: int = 1,
     ) -> None:
-        self._events: asyncio.Queue[Any] = asyncio.Queue()
+        if outbound_event_queue_capacity < 1:
+            raise ValueError("outbound_event_queue_capacity must be at least one")
+        self._events: asyncio.Queue[Any] = asyncio.Queue(maxsize=outbound_event_queue_capacity)
         self.llm = llm
         self.tts = tts
         self.asr = asr
         self.turn = turn
         self.policy_engine = policy_engine
+        self.interpretation_translator = interpretation_translator
         self.controller = controller if controller is not None else ConversationController()
         self.prompt_builder = prompt_builder or _default_prompt_builder
         self.segmenter = segmenter or LanguageAwareTextSegmenter()
         self.tts_queue_capacity = tts_queue_capacity
+        self.audio_output_sample_rate = audio_output_sample_rate
+        self.audio_output_channels = audio_output_channels
         self.session_state = SessionState()
         self.fusion = fusion if fusion is not None else SpeechEventFusion(session_state=self.session_state)
         self._response_identifiers = 0
         self._connected = 0
         self._started = False
         self._closed_stream = False
+        self._terminal_error: BaseException | None = None
         self._generation_slot = ActiveTaskSlot()
         self._generation_token: CancellationToken | None = None
         self._assistant_last_text = ""
         self._sender_playback = PlaybackCoordinator(send_command=self._publish_command)
+        self._runtime_interpretation_sink = interpretation_sink or RuntimeBackedTranslationSink(self)
         super().__init__(
             session_id,
             playback=self._sender_playback,
             cancel_generation=self._cancel_generation_hook,
+            interpretation_translator=interpretation_translator,
+            interpretation_sink=self._runtime_interpretation_sink if interpretation_translator is not None else interpretation_sink,
         )
 
     async def start(self) -> None:
@@ -142,10 +321,23 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
 
     async def events(self) -> AsyncIterator[Any]:
         while True:
+            if self._closed_stream and self._events.empty():
+                error = self._terminal_error
+                if error is not None:
+                    raise error
+                return
             item = await self._events.get()
             if item is _EVENT_STREAM_STOP:
+                error = self._terminal_error
+                if error is not None:
+                    raise error
                 return
             yield item
+            if self._closed_stream and self._events.empty():
+                error = self._terminal_error
+                if error is not None:
+                    raise error
+                return
 
     async def accept_audio_frame(self, frame: RealtimeAudioFrame) -> None:
         await super().accept_audio_frame(frame)
@@ -204,7 +396,10 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         await self._generation_slot.cancel()
         await super().close()
         self._closed_stream = True
-        await self._events.put(_EVENT_STREAM_STOP)
+        try:
+            self._events.put_nowait(_EVENT_STREAM_STOP)
+        except asyncio.QueueFull:
+            pass
 
     async def _process_audio_frame(self, frame: RealtimeAudioFrame) -> None:
         transcript: TranscriptChunk | None = None
@@ -213,6 +408,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             if transcript is not None:
                 await self._publish({"event": "transcript", "payload": transcript.to_dict()})
                 self.fusion.accept_transcript(transcript)
+                await self._route_transcript_to_interpretation(transcript)
         if self.turn is None or not callable(getattr(self.turn, "push_pcm", None)):
             return
         for candidate in await self.turn.push_pcm(frame):
@@ -235,6 +431,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         if final_chunk.text or final_chunk.is_final:
             await self._publish({"event": "transcript", "payload": final_chunk.to_dict()})
             self.fusion.accept_transcript(final_chunk)
+            await self._route_transcript_to_interpretation(final_chunk)
             return final_chunk
         return transcript
 
@@ -243,6 +440,8 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         candidate: Any,
         transcript: TranscriptChunk | None,
     ) -> None:
+        if self.conversation_mode is ConversationMode.INTERPRETATION:
+            return
         if transcript is None and candidate.event != "USER_BACKCHANNEL_CANDIDATE":
             return
         if self.policy_engine is None:
@@ -362,7 +561,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                     self.record_audio_chunk(chunk)
                     self.session_state.response = ResponseState.PLAYING
                     self.session_state.floor = FloorState.ASSISTANT
-                    await self._publish(chunk)
+                    await self._publish_audio_chunk(chunk)
             finally:
                 queue.task_done()
 
@@ -431,7 +630,35 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
     async def _publish(self, value: Any) -> None:
         if self._closed_stream:
             return
-        await self._events.put(value)
+        try:
+            self._events.put_nowait(value)
+        except asyncio.QueueFull as exc:
+            self._terminal_error = SlowConsumerError("outbound event queue is full")
+            await self.close()
+            raise self._terminal_error from exc
+
+    async def _publish_audio_chunk(self, chunk: AudioChunk) -> None:
+        await self._publish(
+            {
+                "event": "audio_chunk",
+                "response_id": chunk.response_id,
+                "generation_epoch": chunk.generation_epoch,
+                "segment_id": chunk.segment_id,
+                "playback_attempt_id": chunk.playback_attempt_id,
+                "payload": {
+                    **chunk.to_dict(),
+                    "sample_rate": self.audio_output_sample_rate,
+                    "channels": self.audio_output_channels,
+                },
+            }
+        )
+
+    async def _route_transcript_to_interpretation(self, transcript: TranscriptChunk) -> None:
+        if self.conversation_mode is not ConversationMode.INTERPRETATION:
+            return
+        if not _is_committed_transcript_chunk(transcript):
+            return
+        await self.accept_transcript_chunk(transcript)
 
     def _unplayed_text_summary(self) -> str:
         if self.current_response_id is None:
@@ -519,6 +746,24 @@ async def _iterate_maybe_async(stream: Any) -> AsyncIterator[Any]:
         yield item
 
 
+def _coerce_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("translated_text", "generated_text", "text", "token"):
+            text = value.get(key)
+            if isinstance(text, str):
+                return text
+    text = getattr(value, "text", None)
+    if isinstance(text, str):
+        return text
+    raise TypeError("translation output must contain text")
+
+
+def _is_committed_transcript_chunk(chunk: TranscriptChunk) -> bool:
+    return bool(chunk.text or chunk.committed_text or chunk.replaces_committed or chunk.is_final)
+
+
 def _normalize_command_event(
     command: Any,
     *,
@@ -553,44 +798,45 @@ def _default_prompt_builder(text: str) -> str:
 
 
 class ProductionRealtimeRuntimeFactory:
-    """Build per-session runtimes around one shared real-model adapter bundle."""
+    """Build per-session runtimes around shared heavyweight runtime resources."""
 
     def __init__(
         self,
-        builder: Callable[[], dict[str, Any]],
+        resource_builder: Callable[[], dict[str, Any]],
+        session_builder: Callable[[dict[str, Any]], dict[str, Any]],
         *,
         prompt_builder: Callable[[str], str] | None = None,
+        session_options: Mapping[str, Any] | None = None,
     ) -> None:
-        self._builder = builder
-        self._bundle: dict[str, Any] | None = None
+        self._resource_builder = resource_builder
+        self._session_builder = session_builder
+        self._resources: dict[str, Any] | None = None
         self.prompt_builder = prompt_builder or _default_prompt_builder
+        self.session_options = dict(session_options or {})
 
     def __call__(self, session_id: str) -> ServerRealtimeSessionRuntime:
-        bundle = self._bundle
-        if bundle is None:
-            bundle = self._builder()
-            self._bundle = bundle
+        resources = self._resources
+        if resources is None:
+            resources = self._resource_builder()
+            self._resources = resources
+        components = self._session_builder(resources)
         return ServerRealtimeSessionRuntime(
             session_id,
-            llm=bundle["llm"],
-            tts=bundle["tts"],
-            asr=bundle.get("asr"),
-            turn=bundle.get("turn"),
-            policy_engine=bundle.get("policy_engine"),
+            llm=components["llm"],
+            tts=components["tts"],
+            asr=components.get("asr"),
+            turn=components.get("turn"),
+            policy_engine=components.get("policy_engine"),
+            interpretation_translator=components.get("interpretation_translator"),
             prompt_builder=self.prompt_builder,
+            **self.session_options,
         )
 
     async def close(self) -> None:
-        bundle = self._bundle
-        if bundle is None:
+        resources = self._resources
+        if resources is None:
             return
-        for resource in (
-            bundle.get("turn"),
-            bundle.get("asr"),
-            bundle.get("policy_engine"),
-            bundle.get("llm"),
-            bundle.get("tts"),
-        ):
+        for resource in resources.values():
             await _close_runtime_resource(resource)
 
 
@@ -598,25 +844,79 @@ def build_production_runtime_factory(
     *,
     model_config: Mapping[str, Any],
     overrides: Mapping[str, Any] | None = None,
+    runtime_loaders: Mapping[str, Callable[[Mapping[str, Any]], Any]] | None = None,
+    audio_config: Mapping[str, Any] | None = None,
+    session_options: Mapping[str, Any] | None = None,
 ) -> ProductionRealtimeRuntimeFactory:
     """Compose the production realtime stack from configured model profiles."""
     effective = _effective_model_config(model_config, overrides or {})
+    loaders = dict(_default_runtime_loaders())
+    loaders.update(runtime_loaders or {})
+    resolved_session_options = dict(session_options or {})
+    if audio_config is not None:
+        output_config = dict(audio_config.get("output", {}))
+        resolved_session_options.setdefault(
+            "audio_output_sample_rate",
+            int(output_config.get("sample_rate", 24000)),
+        )
+        resolved_session_options.setdefault(
+            "audio_output_channels",
+            int(output_config.get("channels", 1)),
+        )
 
-    def builder() -> dict[str, Any]:
-        llm = create_llm_adapter(effective["llm"])
-        tts = create_tts_adapter(effective["tts"])
-        asr = create_realtime_asr_provider(effective["asr"])
-        turn = create_turn_provider(effective["turn"], runtime=_load_x2_runtime())
-        policy_provider = create_policy_provider(effective["policy"])
-        return {
-            "llm": llm,
-            "tts": tts,
-            "asr": asr,
-            "turn": turn,
-            "policy_engine": SemanticPolicyEngine(policy_provider),
+    def resource_builder() -> dict[str, Any]:
+        resources: dict[str, Any] = {}
+        for name in ("asr", "turn", "policy", "llm", "tts", "translation"):
+            profile = effective.get(name)
+            if not profile:
+                continue
+            loaded = loaders[name](profile)
+            resources[name] = _SharedRuntimeBoundary(loaded)
+        return resources
+
+    def session_builder(resources: dict[str, Any]) -> dict[str, Any]:
+        components: dict[str, Any] = {
+            "llm": create_llm_adapter(
+                effective["llm"],
+                provider=_SessionRuntimeProxy(resources["llm"]),
+            ),
+            "tts": create_tts_adapter(
+                effective["tts"],
+                provider=_SessionRuntimeProxy(resources["tts"]),
+            ),
         }
+        if "asr" in resources:
+            components["asr"] = create_realtime_asr_provider(
+                effective["asr"],
+                runtime=_SessionRuntimeProxy(resources["asr"]),
+            )
+        if "turn" in resources:
+            components["turn"] = create_turn_provider(
+                effective["turn"],
+                runtime=_SessionRuntimeProxy(resources["turn"]),
+            )
+        if "policy" in resources:
+            components["policy_engine"] = SemanticPolicyEngine(
+                create_policy_provider(
+                    effective["policy"],
+                    provider=_SessionRuntimeProxy(resources["policy"]),
+                )
+            )
+        translation_profile = effective.get("translation")
+        if translation_profile and "translation" in resources:
+            components["interpretation_translator"] = QwenTranslationAdapter(
+                translation_profile["model_path"],
+                runtime=_SessionRuntimeProxy(resources["translation"]),
+                device=translation_profile.get("device", "cuda"),
+                options=translation_profile.get("options"),
+            )
+        return components
 
-    return ProductionRealtimeRuntimeFactory(builder)
+    return ProductionRealtimeRuntimeFactory(
+        resource_builder,
+        session_builder,
+        session_options=resolved_session_options,
+    )
 
 
 def _effective_model_config(
@@ -625,7 +925,7 @@ def _effective_model_config(
 ) -> dict[str, dict[str, Any]]:
     models = model_config.get("models", model_config)
     result: dict[str, dict[str, Any]] = {}
-    for name in ("asr", "turn", "policy", "llm", "tts"):
+    for name in ("asr", "turn", "policy", "llm", "tts", "translation"):
         profile = dict(models.get(name, {}))
         if not profile and name == "turn":
             profile = {
@@ -644,6 +944,8 @@ def _effective_model_config(
         else:
             profile.setdefault("model_path", profile.get("local_path"))
         if name == "llm":
+            profile["provider"] = "transformers"
+        if name == "translation":
             profile["provider"] = "transformers"
         if name == "tts":
             profile["provider"] = "cosyvoice_worker"
@@ -672,14 +974,67 @@ def _load_x2_runtime() -> Any:
     return X2TurnAdapter().backend
 
 
+def _default_runtime_loaders() -> dict[str, Callable[[Mapping[str, Any]], Any]]:
+    return {
+        "asr": _load_faster_whisper_runtime_from_profile,
+        "turn": lambda _profile: _load_x2_runtime(),
+        "policy": _load_qwen_policy_runtime_from_profile,
+        "llm": _load_qwen_runtime_from_profile,
+        "tts": _load_cosyvoice_runtime_from_profile,
+        "translation": _load_qwen_runtime_from_profile,
+    }
+
+
+def _load_faster_whisper_runtime_from_profile(profile: Mapping[str, Any]) -> Any:
+    from src.adapters.asr.providers.faster_whisper_streaming import _load_faster_whisper_runtime
+
+    options = dict(profile.get("options", {}))
+    return _load_faster_whisper_runtime(
+        profile["model_path"],
+        device=str(profile.get("device", "cuda")),
+        compute_type=str(options.get("compute_type", "float16")),
+    )
+
+
+def _load_qwen_runtime_from_profile(profile: Mapping[str, Any]) -> Any:
+    from src.adapters.llm.providers.qwen_transformers import TransformersQwenProvider
+
+    provider = TransformersQwenProvider(
+        profile["model_path"],
+        device=str(profile.get("device", "cuda")),
+        options=profile.get("options"),
+    )
+    return provider.runtime
+
+
+def _load_qwen_policy_runtime_from_profile(profile: Mapping[str, Any]) -> Any:
+    from src.adapters.llm.providers.qwen_policy import _load_transformers_runtime
+
+    options = dict(profile.get("options", {}))
+    return _load_transformers_runtime(
+        profile.get("model_path"),
+        str(profile.get("device", "cuda")),
+        str(options.get("quantization", "none")),
+    )
+
+
+def _load_cosyvoice_runtime_from_profile(profile: Mapping[str, Any]) -> Any:
+    from src.adapters.tts.providers.cosyvoice_worker import CosyVoiceWorkerClient
+
+    return CosyVoiceWorkerClient(
+        profile["model_path"],
+        **dict(profile.get("options", {})),
+    )
+
+
 async def _close_runtime_resource(resource: Any) -> None:
     if resource is None:
         return
     for candidate in (
         resource,
+        getattr(resource, "runtime", None),
         getattr(resource, "provider", None),
         getattr(getattr(resource, "provider", None), "runtime", None),
-        getattr(resource, "provider", None),
     ):
         close = getattr(candidate, "close", None) if candidate is not None else None
         if callable(close):

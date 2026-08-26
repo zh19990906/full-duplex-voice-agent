@@ -20,12 +20,33 @@
 - Aligned the frontend message send path to websocket command submission instead of the old synchronous `/message` response path.
 - Updated event serialization so response/runtime identity is available at the envelope level for playback/runtime flows.
 
+## Review Fix Follow-up
+
+- Reworked the production runtime factory so it caches only shared heavyweight loaded runtimes and creates fresh per-session ASR / turn / policy / chat-LLM / TTS / translation wrappers.
+- Added injected runtime-loader seams for the checked-in real stack paths:
+  - faster-whisper ASR
+  - X2 turn detection
+  - Qwen policy
+  - Qwen-compatible chat/translation
+  - CosyVoice worker runtime
+- Added a production factory smoke test that uses injected loaded-runtime doubles but still follows the real composition shape and creates a session.
+- Wired live interpretation mode in `ServerRealtimeSessionRuntime`:
+  - committed revision-aware ASR chunks are routed into `accept_transcript_chunk(...)` only while interpretation mode is active
+  - a runtime-backed translation sink now publishes translation events, TTS audio, playback identity, and checkpoint state
+- Added bounded outbound event backpressure:
+  - queue capacity is configurable
+  - queue overflow raises an explicit slow-consumer failure
+  - the runtime closes cleanly after preserving already-buffered events
+  - websocket slow-consumer cleanup now closes the websocket, closes the runtime, and removes the dead session
+- Threaded the real `audio_config` output sample rate/channel settings into runtime audio event publication instead of leaving that CLI/config path unused.
+- Aligned the frontend to accept and display `translation` websocket events.
+
 ## Verification
 
 Targeted Task 13 tests:
 
 ```bash
-python3 -m unittest tests.test_realtime_bootstrap tests.test_real_server_script tests.test_realtime_websocket_flow -v
+python3 -m unittest -q tests.test_runtime_app_container tests.test_realtime_bootstrap tests.test_realtime_websocket_flow tests.test_real_server_script tests.test_real_server_annotations tests.test_interpretation_runtime_integration tests.test_web_ui
 ```
 
 Result: PASS
@@ -33,15 +54,7 @@ Result: PASS
 Frontend Node tests:
 
 ```bash
-node --test tests/frontend_audio_capture_test.mjs tests/frontend_playback_test.mjs tests/frontend_streaming_test.mjs
-```
-
-Result: PASS
-
-Frontend Python wrappers:
-
-```bash
-python3 -m unittest tests.test_frontend_audio_capture tests.test_frontend_streaming tests.test_frontend_playback tests.test_web_ui -v
+node --test tests/*.mjs
 ```
 
 Result: PASS
@@ -49,7 +62,7 @@ Result: PASS
 Additional touched-area validation:
 
 ```bash
-python3 -m unittest tests.test_application_bootstrap tests.test_application_imports tests.test_real_server_annotations tests.test_web_ui tests.test_provider_factory tests.test_deployment_config tests.test_model_deployment tests.test_realtime_audio_ingress tests.test_real_backchannel_resume tests.test_interpretation_mode_policy tests.test_interpretation_runtime_integration -v
+python3 -m unittest -q tests.test_runtime_app_container tests.test_realtime_bootstrap tests.test_realtime_websocket_flow tests.test_real_server_script tests.test_real_server_annotations tests.test_interpretation_runtime_integration tests.test_web_ui
 ```
 
 Result: PASS
@@ -60,15 +73,15 @@ Full Python suite:
 python3 -m unittest discover -s tests -p 'test_*.py' -q
 ```
 
-Result: PASS (`Ran 477 tests ... OK`)
+Result: PASS (`Ran 482 tests ... OK`)
 
-Whitespace/sanity check:
+Frontend full suite:
 
 ```bash
-git diff --check
+node --test tests/*.mjs
 ```
 
-Result: clean
+Result: PASS (`33` tests)
 
 ## Notes
 

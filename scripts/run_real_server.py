@@ -21,7 +21,8 @@ def build_app(args: argparse.Namespace):
     from src.runtime_app.container import build_production_runtime_factory
 
     model_config = load_yaml(getattr(args, "config", ROOT / "configs" / "models.yaml"))
-    _audio_config = load_yaml(getattr(args, "audio_config", ROOT / "configs" / "audio.yaml"))
+    loaded_audio_config = load_yaml(getattr(args, "audio_config", ROOT / "configs" / "audio.yaml"))
+    audio_config = loaded_audio_config.get("audio", loaded_audio_config)
     overrides = {
         "asr_model": getattr(args, "asr_model", None),
         "turn_model": getattr(args, "turn_model", None),
@@ -38,6 +39,7 @@ def build_app(args: argparse.Namespace):
     runtime_factory = build_production_runtime_factory(
         model_config=model_config,
         overrides=overrides,
+        audio_config=audio_config,
     )
     settings = RealtimeServerSettings(
         static_dir=ROOT / "frontend",
