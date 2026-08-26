@@ -249,8 +249,7 @@ class RealtimeSessionRuntime:
         payload = dict(action.payload or {})
         target_mode = payload.get("target_mode")
         if target_mode == ConversationMode.CHAT.value:
-            self.conversation_mode = ConversationMode.CHAT
-            self._clear_interpretation_pipeline(clear_session=True)
+            self._exit_interpretation_mode()
             return
         if target_mode != ConversationMode.INTERPRETATION.value:
             raise ValueError("unsupported target_mode")
@@ -304,6 +303,19 @@ class RealtimeSessionRuntime:
         self._interpretation_pipeline = pipeline
         self.interpretation_session = pipeline.session
         self.activate_response(pipeline.session.response_id)
+
+    def _exit_interpretation_mode(self) -> None:
+        if self.conversation_mode is not ConversationMode.INTERPRETATION and self.interpretation_session is None:
+            self.conversation_mode = ConversationMode.CHAT
+            return
+        response_id = self.current_response_id
+        self.conversation_mode = ConversationMode.CHAT
+        if response_id is not None:
+            self.checkpoints.discard_unplayed(response_id)
+        self.generation_clock.advance()
+        self.current_response_id = None
+        self.playback.clear_active_response()
+        self._clear_interpretation_pipeline(clear_session=True)
 
     def _restart_interpretation_pipeline(self) -> None:
         if self.conversation_mode is not ConversationMode.INTERPRETATION:

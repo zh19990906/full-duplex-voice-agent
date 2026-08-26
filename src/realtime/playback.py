@@ -57,6 +57,12 @@ class PlaybackCoordinator:
         self._active_playback_attempt_id = self._next_attempt_id()
         self._attempt_required = False
 
+    def clear_active_response(self) -> None:
+        self._active_response_id = None
+        self._active_generation_epoch = None
+        self._active_playback_attempt_id = None
+        self._attempt_required = False
+
     async def apply(self, action: ControllerAction) -> ResumePlan | None:
         if action.action_type is ActionType.DUCK_RESPONSE:
             await self._emit("DUCK")

@@ -113,6 +113,44 @@ class CooperativeBlockingRuntimeSink:
         self.completed.set()
 
 
+class NonCooperativeBlockingRuntimeSink:
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.items = []
+        self.recorded_segments = []
+        self.recorded_audio = []
+
+    async def publish(self, segment):
+        self.started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            text_segment = TextSegment(
+                segment.translation_segment_id,
+                segment.translated_text,
+                False,
+                segment.response_id,
+                segment.generation_epoch,
+            )
+            audio_chunk = AudioChunk(
+                chunk_id=f"{segment.response_id}:{segment.generation_epoch}:{segment.translation_segment_id}",
+                audio_data=b"\x00\x00" * 2,
+                timestamp=segment.translation_segment_id + 1.0,
+                is_final=True,
+                request_id=f"{segment.response_id}:{segment.generation_epoch}:{segment.translation_segment_id}",
+                response_id=segment.response_id,
+                generation_epoch=segment.generation_epoch,
+                segment_id=segment.translation_segment_id,
+            )
+            self.recorded_segments.append(self.runtime.record_response_segment(text_segment))
+            self.recorded_audio.append(self.runtime.record_audio_chunk(audio_chunk))
+            return
+        self.items.append(segment)
+
+
 class InterpretationRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_asr_events_flow_through_runtime_interpretation_pipeline(self):
         translator = RecordingTranslator(["Hello"])
@@ -366,4 +404,67 @@ class InterpretationRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sink.recorded_segments, [])
         self.assertEqual(sink.recorded_audio, [])
         checkpoint = runtime.checkpoints.get(blocked_response_id)
+        self.assertEqual(checkpoint.segments, {})
+
+    async def test_switch_to_chat_is_identity_boundary_for_noncooperative_sink(self):
+        translator = RecordingTranslator(["Hello"])
+        runtime = RealtimeSessionRuntime("session-interpret", interpretation_translator=translator)
+        sink = NonCooperativeBlockingRuntimeSink(runtime)
+        runtime.interpretation_sink = sink
+        await runtime.apply_controller_actions(
+            (
+                ControllerAction(
+                    ActionType.SWITCH_MODE,
+                    {
+                        "target_mode": "INTERPRETATION",
+                        "source_language": None,
+                        "target_language": "English",
+                    },
+                ),
+            )
+        )
+        blocked_response_id = runtime.current_response_id
+        blocked_epoch = runtime.generation_epoch
+
+        task = asyncio.create_task(
+            runtime.accept_transcript_chunk(
+                TranscriptChunk("chunk-1", "你好", 1.0, False, revision_id=1)
+            )
+        )
+        await sink.started.wait()
+        await runtime.apply_controller_actions(
+            (
+                ControllerAction(
+                    ActionType.SWITCH_MODE,
+                    {
+                        "target_mode": "CHAT",
+                        "source_language": None,
+                        "target_language": None,
+                    },
+                ),
+            )
+        )
+        result = await task
+
+        checkpoint = runtime.checkpoints.get(blocked_response_id)
+        self.assertIsNone(result)
+        self.assertTrue(sink.cancelled.is_set())
+        self.assertEqual(sink.items, [])
+        self.assertEqual(sink.recorded_segments, [False])
+        self.assertEqual(sink.recorded_audio, [False])
+        self.assertFalse(
+            runtime.ack_playback(
+                blocked_response_id,
+                generation_epoch=blocked_epoch,
+                segment_id=0,
+                sample_offset=1,
+            )
+        )
+        self.assertEqual(runtime.conversation_mode.value, "CHAT")
+        self.assertIsNone(runtime.current_response_id)
+        self.assertIsNone(runtime.interpretation_session)
+        self.assertGreater(runtime.generation_epoch, blocked_epoch)
+        self.assertFalse(checkpoint.resumable)
+        self.assertFalse(checkpoint.archived)
+        self.assertIsNone(runtime.checkpoints.resume(blocked_response_id))
         self.assertEqual(checkpoint.segments, {})
