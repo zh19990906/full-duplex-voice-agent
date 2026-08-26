@@ -79,6 +79,9 @@ class PlaybackCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             serialized,
             {
                 "event": "RESUME_RESPONSE",
+                "response_id": "response-2",
+                "generation_epoch": 2,
+                "playback_attempt_id": plan.playback_attempt_id,
                 "payload": {
                     "response_id": "response-2",
                     "generation_epoch": 2,

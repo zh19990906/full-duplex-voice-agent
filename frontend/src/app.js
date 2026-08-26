@@ -130,15 +130,14 @@ export function bootResearchConsole(
   byId("message-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     await playback.unlock();
-    if (!state.sessionId) return setStatus("请先创建会话");
+    if (!state.sessionId || !state.socket) return setStatus("请先创建会话");
     const input = byId("message");
     const message = input.value.trim();
     if (!message) return;
     appendChat("user", message);
     input.value = "";
     assistantMessage.begin();
-    const response = await api.sendMessage(state.sessionId, message);
-    assistantMessage.finalize(response.response);
+    state.socket.sendText(message);
   });
 
   byId("start-mic").addEventListener("click", async () => {

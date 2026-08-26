@@ -2,14 +2,14 @@ model_root: ./models
 
 asr:
   provider: whisper
-  model_id: example/whisper-asr
+  model_id: faster-whisper-large-v3
   local_path: ./models/asr
   device: cuda
   auto_load: true
 
 llm:
   provider: llama_cpp
-  model_id: example/llama-cpp-llm
+  model_id: Qwen/Qwen2.5-14B-Instruct
   local_path: ./models/llm
   device: cuda
   auto_load: true
@@ -17,20 +17,20 @@ llm:
 policy:
   provider: local
   model_id: Qwen/Qwen2.5-1.5B-Instruct
-  local_path: ./models/policy/Qwen2.5-1.5B-Instruct
+  local_path: ./models/policy
   device: cuda
   auto_load: false
 
 tts:
   provider: cosyvoice
-  model_id: example/cosyvoice-tts
+  model_id: FunAudioLLM/CosyVoice3-0.5B
   local_path: ./models/tts
-  device: cpu
+  device: cuda
   auto_load: false
 
 translation:
   provider: huggingface
-  model_id: example/translation-model
+  model_id: Qwen/Qwen2.5-14B-Instruct
   local_path: ./models/translation
-  device: cpu
+  device: cuda
   auto_load: false

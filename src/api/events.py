@@ -48,6 +48,7 @@ class ApiEventSerializer:
             "event": event_name,
             "payload": ApiEventSerializer._json_safe(payload),
         }
+        ApiEventSerializer._copy_identity_fields(envelope, payload)
         if isinstance(value, BaseEvent):
             envelope.update(
                 {
@@ -69,3 +70,17 @@ class ApiEventSerializer:
         if isinstance(value, (list, tuple)):
             return [ApiEventSerializer._json_safe(item) for item in value]
         return value
+
+    @staticmethod
+    def _copy_identity_fields(envelope: dict[str, Any], payload: Mapping[str, Any]) -> None:
+        for key in (
+            "response_id",
+            "generation_epoch",
+            "segment_id",
+            "playback_attempt_id",
+            "sample_rate",
+            "channels",
+        ):
+            value = payload.get(key)
+            if value is not None:
+                envelope[key] = ApiEventSerializer._json_safe(value)

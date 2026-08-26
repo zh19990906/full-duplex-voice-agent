@@ -18,7 +18,7 @@ from src.realtime.session_state import ConversationMode
 from src.realtime.text_segmenter import TextSegment
 from src.tts_runtime.stream import AudioChunk
 
-from .audio_ingress import AudioIngress
+from .audio_ingress import AudioIngress, RealtimeAudioFrame
 from .cancellation import CancellationToken
 from .checkpoint import ResponseCheckpointStore, ResumePlan
 from .identifiers import GenerationClock, IdentifierAllocator
@@ -190,6 +190,12 @@ class RealtimeSessionRuntime:
         if self._closed:
             raise RuntimeError("realtime session runtime is closed")
         await self.ingress.push(frame)
+
+    async def accept_audio_frame(self, frame: RealtimeAudioFrame) -> None:
+        """Accept one already-decoded browser audio frame."""
+        if self._closed:
+            raise RuntimeError("realtime session runtime is closed")
+        await self.ingress.push_decoded(frame)
 
     async def flush(self) -> None:
         """Wait for this session's accepted audio to reach all consumers."""

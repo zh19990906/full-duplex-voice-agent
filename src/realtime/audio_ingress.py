@@ -124,7 +124,12 @@ class AudioIngress:
     async def push(self, frame: bytes) -> None:
         """Decode and accept one V1 browser frame without blocking consumers."""
         header, pcm = decode_audio_frame(frame)
-        decoded = RealtimeAudioFrame(header=header, pcm=pcm)
+        await self.push_decoded(RealtimeAudioFrame(header=header, pcm=pcm))
+
+    async def push_decoded(self, decoded: RealtimeAudioFrame) -> None:
+        """Accept one already-decoded V1 browser frame."""
+        if not isinstance(decoded, RealtimeAudioFrame):
+            raise TypeError("decoded must be RealtimeAudioFrame")
 
         async with self._lock:
             if self._closed:

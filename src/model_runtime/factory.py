@@ -12,13 +12,16 @@ from pathlib import Path
 from typing import Any
 
 from src.adapters.asr.backend import StreamingASRBackend
+from src.adapters.asr.providers.faster_whisper_streaming import FasterWhisperStreamingProvider
 from src.adapters.asr.providers.whisper import WhisperASRProvider
 from src.adapters.llm.backend import StreamingLLMBackend
+from src.adapters.llm.providers.qwen_policy import QwenPolicyProvider
 from src.adapters.llm.providers.llama_cpp import LlamaCppLLMProvider
 from src.adapters.llm.providers.qwen_transformers import TransformersQwenProvider
 from src.adapters.tts.backend import StreamingTTSBackend
 from src.adapters.tts.providers.cosyvoice import CosyVoiceTTSProvider
 from src.adapters.tts.providers.cosyvoice_worker import CosyVoiceWorkerClient
+from src.adapters.turn.x2_turn_streaming import X2TurnRollingProvider
 
 from .lifecycle import ModelLifecycleManager
 from .resolver import ModelProfile
@@ -234,3 +237,52 @@ def create_tts_adapter(
     lifecycle_manager: ModelLifecycleManager | None = None,
 ) -> StreamingTTSBackend:
     return _FACTORY.create_tts_adapter(config, provider, lifecycle_manager)
+
+
+def create_realtime_asr_provider(
+    config: Any,
+    runtime: Any | None = None,
+) -> FasterWhisperStreamingProvider:
+    profile = _profile(config, runtime)
+    options = dict(profile.options or {})
+    return FasterWhisperStreamingProvider(
+        profile.model_path,
+        runtime=runtime if runtime is not None else profile.provider_instance,
+        load_model=runtime is None and profile.provider_instance is None,
+        device=profile.device or "cuda",
+        options=options,
+        cadence_ms=int(options.pop("cadence_ms", 300)),
+        context_seconds=float(options.pop("context_seconds", 5.0)),
+    )
+
+
+def create_turn_provider(
+    config: Any,
+    runtime: Any | None = None,
+) -> X2TurnRollingProvider:
+    profile = _profile(config, runtime)
+    options = dict(profile.options or {})
+    return X2TurnRollingProvider(
+        profile.model_path,
+        runtime=runtime if runtime is not None else profile.provider_instance,
+        cadence_ms=int(options.get("cadence_ms", 160)),
+        context_seconds=float(options.get("context_seconds", 2.0)),
+    )
+
+
+def create_policy_provider(
+    config: Any,
+    provider: Any | None = None,
+) -> QwenPolicyProvider:
+    profile = _profile(config, provider)
+    options = dict(profile.options or {})
+    if isinstance(profile.provider_instance, QwenPolicyProvider):
+        return profile.provider_instance
+    return QwenPolicyProvider(
+        profile.model_path,
+        runtime=profile.provider_instance,
+        load_local=profile.provider_instance is None,
+        device=profile.device or "cuda",
+        quantization=str(options.get("quantization", "none")),
+        max_new_tokens=int(options.get("max_new_tokens", 64)),
+    )
