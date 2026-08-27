@@ -30,6 +30,7 @@ from src.realtime.text_segmenter import LanguageAwareTextSegmenter, TextSegment
 from src.runtime.event_bus import EventBus
 from src.runtime.scheduler import RealtimeScheduler
 from src.tts_runtime.stream import AudioChunk
+from src.adapters.turn.config import X2TurnConfig
 from src.model_runtime.factory import (
     create_llm_adapter,
     create_policy_provider,
@@ -184,28 +185,64 @@ class _SharedRuntimeBoundary:
 
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
-        self._lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
+        self._control_lock = asyncio.Lock()
+        self._owner_lock = asyncio.Lock()
+        self._active_owner: object | None = None
 
-    async def call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
-        async with self._lock:
+    async def call(self, owner: object, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        async with self._operation_lock:
+            await self._set_active_owner(owner)
+            try:
+                method = getattr(self.runtime, method_name, None)
+                if not callable(method):
+                    raise RuntimeError(f"shared runtime must expose {method_name}()")
+                result = method(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+            finally:
+                await self._clear_active_owner(owner)
+
+    async def iterate(
+        self,
+        owner: object,
+        method_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        async with self._operation_lock:
+            await self._set_active_owner(owner)
+            try:
+                method = getattr(self.runtime, method_name, None)
+                if not callable(method):
+                    raise RuntimeError(f"shared runtime must expose {method_name}()")
+                result = method(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                async for item in _iterate_maybe_async(result):
+                    yield item
+            finally:
+                await self._clear_active_owner(owner)
+
+    async def control(
+        self,
+        owner: object,
+        method_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        async with self._control_lock:
+            active_owner = await self._get_active_owner()
+            if active_owner is not None and active_owner is not owner:
+                return False
             method = getattr(self.runtime, method_name, None)
             if not callable(method):
-                raise RuntimeError(f"shared runtime must expose {method_name}()")
+                return False
             result = method(*args, **kwargs)
             if inspect.isawaitable(result):
-                return await result
-            return result
-
-    async def iterate(self, method_name: str, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        async with self._lock:
-            method = getattr(self.runtime, method_name, None)
-            if not callable(method):
-                raise RuntimeError(f"shared runtime must expose {method_name}()")
-            result = method(*args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            async for item in _iterate_maybe_async(result):
-                yield item
+                await result
+            return True
 
     async def close(self) -> None:
         close = getattr(self.runtime, "close", None)
@@ -215,6 +252,19 @@ class _SharedRuntimeBoundary:
         if inspect.isawaitable(result):
             await result
 
+    async def _get_active_owner(self) -> object | None:
+        async with self._owner_lock:
+            return self._active_owner
+
+    async def _set_active_owner(self, owner: object) -> None:
+        async with self._owner_lock:
+            self._active_owner = owner
+
+    async def _clear_active_owner(self, owner: object) -> None:
+        async with self._owner_lock:
+            if self._active_owner is owner:
+                self._active_owner = None
+
 
 class _SessionRuntimeProxy:
     """Per-session façade around one serialized heavyweight runtime boundary."""
@@ -223,32 +273,39 @@ class _SessionRuntimeProxy:
         self.runtime = boundary
 
     async def transcribe(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.runtime.call("transcribe", *args, **kwargs)
+        return await self.runtime.call(self, "transcribe", *args, **kwargs)
 
     async def infer(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.runtime.call("infer", *args, **kwargs)
+        return await self.runtime.call(self, "infer", *args, **kwargs)
 
     async def generate(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.runtime.call("generate", *args, **kwargs)
+        return await self.runtime.call(self, "generate", *args, **kwargs)
 
     async def translate_stream(self, *args: Any, **kwargs: Any) -> Any:
-        return await self.runtime.call("generate", *args, **kwargs)
+        method_name = "translate_stream" if callable(getattr(self.runtime.runtime, "translate_stream", None)) else "generate"
+        return await self.runtime.call(self, method_name, *args, **kwargs)
 
     async def stream_tokens(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        async for item in self.runtime.iterate("stream_tokens", *args, **kwargs):
+        async for item in self.runtime.iterate(self, "stream_tokens", *args, **kwargs):
             yield item
 
     async def stream_audio(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        async for item in self.runtime.iterate("stream_audio", *args, **kwargs):
+        async for item in self.runtime.iterate(self, "stream_audio", *args, **kwargs):
             yield item
 
-    async def cancel(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
+    async def cancel(self, *args: Any, **kwargs: Any) -> bool:
+        return await self.runtime.control(self, "cancel", *args, **kwargs)
 
-    async def interrupt(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
+    async def interrupt(self, *args: Any, **kwargs: Any) -> bool:
+        return await self.runtime.control(self, "interrupt", *args, **kwargs)
 
     def reset(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.runtime.control(self, "reset"))
+            return None
+        loop.create_task(self.runtime.control(self, "reset"))
         return None
 
 
@@ -934,6 +991,10 @@ def _effective_model_config(
                 "model_path": "./models/turn",
                 "local_path": "./models/turn",
                 "device": "cuda",
+                "options": {
+                    "cadence_ms": 160,
+                    "context_seconds": 2.0,
+                },
             }
         if not profile:
             continue
@@ -968,16 +1029,22 @@ def _effective_model_config(
     return result
 
 
-def _load_x2_runtime() -> Any:
+def _load_x2_runtime_from_profile(profile: Mapping[str, Any]) -> Any:
     from src.adapters.turn.x2_turn_adapter import X2TurnAdapter
 
-    return X2TurnAdapter().backend
+    options = dict(profile.get("options", {}))
+    config = X2TurnConfig(
+        model_path=str(profile.get("model_path", profile.get("local_path"))),
+        device=str(profile.get("device", "cuda")),
+        runtime_options=options,
+    )
+    return X2TurnAdapter(config=config).backend
 
 
 def _default_runtime_loaders() -> dict[str, Callable[[Mapping[str, Any]], Any]]:
     return {
         "asr": _load_faster_whisper_runtime_from_profile,
-        "turn": lambda _profile: _load_x2_runtime(),
+        "turn": _load_x2_runtime_from_profile,
         "policy": _load_qwen_policy_runtime_from_profile,
         "llm": _load_qwen_runtime_from_profile,
         "tts": _load_cosyvoice_runtime_from_profile,

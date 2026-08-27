@@ -41,6 +41,24 @@
 - Threaded the real `audio_config` output sample rate/channel settings into runtime audio event publication instead of leaving that CLI/config path unused.
 - Aligned the frontend to accept and display `translation` websocket events.
 
+## Review Fix Follow-up Round 2
+
+- Replaced the no-op shared-runtime proxy controls with an owner-aware boundary:
+  - active `call(...)` and `iterate(...)` operations register the owning proxy
+  - `cancel(...)`, `interrupt(...)`, and `reset(...)` are forwarded out-of-band only for the active owner or while the boundary is idle
+  - a waiting session cannot cancel another session's active LLM/TTS operation
+  - owner state is cleared in `finally` so later sessions can safely reset/use the shared runtime
+- Preserved request-scoped cancellation arguments across the shared boundary for CosyVoice-style `request_id` cancellation.
+- Replaced the zero-config default X2 loader with a profile-aware loader built on the real `X2TurnConfig` / `X2TurnAdapter` contract.
+- The default X2 loader now honors resolved `model_path` / `local_path`, `device`, loader options, and CLI turn-model overrides.
+- Added regressions covering:
+  - prompt owner LLM cancel while a shared stream is blocked
+  - prompt owner TTS cancel with preserved `request_id`
+  - waiting-session cancel isolation
+  - post-owner reset forwarding without deadlock
+  - profile-aware default X2 loader arguments
+  - bounded default turn profile shape
+
 ## Verification
 
 Targeted Task 13 tests:
@@ -73,7 +91,7 @@ Full Python suite:
 python3 -m unittest discover -s tests -p 'test_*.py' -q
 ```
 
-Result: PASS (`Ran 482 tests ... OK`)
+Result: PASS (`Ran 489 tests ... OK`)
 
 Frontend full suite:
 
