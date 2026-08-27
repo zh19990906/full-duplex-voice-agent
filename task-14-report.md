@@ -10,6 +10,17 @@
 - Added `scripts/run_realtime_acceptance.py` and updated operator docs/environment checks.
 - Wired new browser-visible runtime events into the checked-in frontend.
 
+## Runtime resilience / VRAM fix slice
+
+- Bounded worker supervision now performs at most one restart after backoff, propagates cancellation, and closes idempotently.
+- Final-ASR failure aborts policy/generation; X2 timeout fallback requires silent activity plus stable/final ASR evidence.
+- LLM failure pauses and preserves the response checkpoint and publishes identity-bearing `llm_failed`.
+- Production TTS recovery closes and replaces the shared worker, then resubmits checkpoint-derived unsynthesized text once with epoch/cancellation fencing.
+- VRAM admission uses an explicit budget or CUDA device capacity, atomically accounts pending and loaded reservations, records measured CUDA deltas, closes over-budget partial loads, and releases accounting on failure or factory close.
+- The frontend event allowlist and status handling now include `llm_failed`.
+
+Focused verification for this slice is recorded in the commit report; hardware/model-integration gates remain external.
+
 ## Verification
 
 Executed locally:

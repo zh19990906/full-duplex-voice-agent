@@ -7,6 +7,7 @@ from src.controller.actions import ActionType, ControllerAction
 from src.realtime.audio_ingress import RealtimeAudioFrame
 from src.realtime.protocol import AudioFrameHeader
 from src.runtime_app.container import (
+    _build_model_manager,
     _SharedRuntimeBoundary,
     _SessionRuntimeProxy,
     _default_runtime_loaders,
@@ -16,6 +17,9 @@ from src.runtime_app.container import (
     SlowConsumerError,
     build_production_runtime_factory,
 )
+from src.model_runtime.manager import ModelMemoryBudgetError
+from src.realtime.cancellation import CancellationToken
+from src.realtime.text_segmenter import TextSegment
 
 
 MODEL_CONFIG = {
@@ -99,6 +103,30 @@ class _SharedTtsRuntime:
     async def stream_audio(self, text, **options):
         self.requests.append((text, dict(options)))
         yield b"\x00\x00" * 2
+
+
+class _ReloadableTtsRuntime:
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.requests = []
+        self.closed = False
+
+    async def stream_audio(self, text, **options):
+        self.requests.append((text, dict(options)))
+        if self.fail:
+            raise RuntimeError("tts worker crashed")
+        yield b"\x00\x00" * 2
+
+    async def close(self):
+        self.closed = True
+
+
+class _ClosableLoadedRuntime:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeStreamingAsr:
@@ -614,3 +642,86 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(effective["turn"]["device"], "cuda")
         self.assertEqual(effective["turn"]["options"]["cadence_ms"], 160)
         self.assertEqual(effective["turn"]["options"]["context_seconds"], 2.0)
+
+    def test_model_manager_uses_explicit_or_cuda_device_budget(self):
+        """Catches production silently disabling VRAM admission without an explicit value."""
+        cuda_config = {"models": {"llm": {"device": "cuda:1"}}}
+        explicit_config = {
+            "models": {"llm": {"device": "cuda:1"}},
+            "runtime": {"vram_budget_bytes": 900, "vram_reserve_bytes": 100},
+        }
+
+        with patch(
+            "src.runtime_app.container._cuda_device_total_memory_bytes",
+            return_value=700,
+        ):
+            derived = _build_model_manager(cuda_config)
+            explicit = _build_model_manager(explicit_config)
+
+        self.assertEqual(derived.total_vram_bytes, 700)
+        self.assertEqual(explicit.total_vram_bytes, 900)
+        self.assertEqual(explicit.reserve_bytes, 100)
+
+    async def test_measured_overage_closes_partial_resource_and_releases_budget(self):
+        """Catches a measured-over-budget model remaining live or reserved after rejection."""
+        loaded = _ClosableLoadedRuntime()
+        config = {
+            "models": {
+                "asr": {
+                    "provider": "local",
+                    "model_path": "/models/asr",
+                    "device": "cuda",
+                    "estimated_vram_bytes": 1,
+                }
+            },
+            "runtime": {"vram_budget_bytes": 50},
+        }
+        with patch(
+            "src.runtime_app.container._measure_cuda_allocated_bytes",
+            side_effect=(0, 60),
+        ):
+            factory = build_production_runtime_factory(
+                model_config=config,
+                runtime_loaders={"asr": lambda _profile: loaded},
+            )
+            with self.assertRaises(ModelMemoryBudgetError):
+                factory("session-over-budget")
+
+        self.assertTrue(loaded.closed)
+        self.assertEqual(factory.memory_diagnostics["loaded_bytes"], 0)
+        self.assertEqual(factory.memory_diagnostics["reserved_bytes"], 0)
+
+    async def test_production_tts_recovery_reloads_and_replaces_shared_worker(self):
+        """Catches production recovery resetting the same closed shared worker."""
+        failed = _ReloadableTtsRuntime(fail=True)
+        replacement = _ReloadableTtsRuntime()
+        tts_runtimes = iter((failed, replacement))
+        shared = {
+            "asr": _SharedAsrRuntime(),
+            "turn": _SharedTurnRuntime(),
+            "policy": _SharedPolicyRuntime(),
+            "llm": _SharedLlmRuntime(),
+            "translation": _SharedTranslationRuntime(),
+        }
+        loaders = {
+            name: (lambda _config, runtime=runtime: runtime)
+            for name, runtime in shared.items()
+        }
+        loaders["tts"] = lambda _profile: next(tts_runtimes)
+        factory = build_production_runtime_factory(
+            model_config=MODEL_CONFIG,
+            runtime_loaders=loaders,
+        )
+        runtime = factory("session-reload-tts")
+        runtime.activate_response("response-reload")
+        runtime.checkpoints.record_segment("response-reload", 0, "checkpoint replay")
+        segment = TextSegment(0, "caller text", False, "response-reload", 0)
+
+        keep_running = await runtime._stream_tts_segment(segment, 0, CancellationToken())
+
+        self.assertTrue(keep_running)
+        self.assertTrue(failed.closed)
+        self.assertEqual([item[0] for item in failed.requests], ["caller text"])
+        self.assertEqual([item[0] for item in replacement.requests], ["checkpoint replay"])
+        await runtime.close()
+        await factory.close()

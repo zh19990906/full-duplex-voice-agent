@@ -256,6 +256,19 @@ class _SharedRuntimeBoundary:
         if inspect.isawaitable(result):
             await result
 
+    async def replace(self, runtime_factory: Callable[[], Any]) -> Any:
+        """Close and replace the shared runtime while operations are fenced."""
+        async with self._control_lock:
+            async with self._operation_lock:
+                old_runtime = self.runtime
+                self.runtime = None
+                await _close_runtime_resource(old_runtime)
+                replacement = runtime_factory()
+                if inspect.isawaitable(replacement):
+                    replacement = await replacement
+                self.runtime = replacement
+                return replacement
+
     async def _get_active_owner(self) -> object | None:
         async with self._owner_lock:
             return self._active_owner
@@ -332,6 +345,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         tts: Any,
         asr: Any | None = None,
         turn: Any | None = None,
+        tts_recovery: Callable[[], Any] | None = None,
         policy_engine: SemanticPolicyEngine | None = None,
         interpretation_translator: Any | None = None,
         interpretation_sink: Any | None = None,
@@ -351,6 +365,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         self.tts = tts
         self.asr = asr
         self.turn = turn
+        self._tts_recovery = tts_recovery
         self.policy_engine = policy_engine
         self.interpretation_translator = interpretation_translator
         self.controller = controller if controller is not None else ConversationController()
@@ -466,6 +481,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             return
         await self._cancel_generation()
         await self._generation_slot.cancel()
+        await self._tts_supervisor.close()
         await super().close()
         self._closed_stream = True
         try:
@@ -512,7 +528,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             final_chunk = await self.asr.finalize_turn()
         except Exception as exc:
             await self.handle_asr_failure(exc)
-            return transcript
+            return None
         if final_chunk.text or final_chunk.is_final:
             await self._publish({"event": "transcript", "payload": final_chunk.to_dict()})
             self.fusion.accept_transcript(final_chunk)
@@ -604,6 +620,29 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                             "response_id": response_id,
                             "generation_epoch": epoch,
                             "text": result.text,
+                        },
+                    }
+                )
+        except Exception as exc:
+            token.cancel()
+            if (
+                self.current_response_id == response_id
+                and self.generation_clock.is_current(epoch)
+            ):
+                checkpoint = self.checkpoints.get(response_id)
+                if checkpoint is not None:
+                    self.checkpoints.pause(response_id)
+                self.session_state.floor = FloorState.USER
+                self.session_state.response = ResponseState.PAUSED
+                await self._publish(
+                    {
+                        "event": "llm_failed",
+                        "response_id": response_id,
+                        "generation_epoch": epoch,
+                        "payload": {
+                            "message": str(exc),
+                            "response_id": response_id,
+                            "generation_epoch": epoch,
                         },
                     }
                 )
@@ -814,7 +853,12 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         activity = self.ingress.last_activity_candidate
         if activity is not None:
             self.fusion.accept_activity(activity)
-        if transcript is None or not transcript.text.strip():
+        if activity is None or activity.active:
+            return
+        if transcript is None:
+            return
+        stable_text = transcript.text.strip() or (transcript.committed_text or "").strip()
+        if not stable_text:
             return
         fallback = SpeechCandidateEvent(
             event="USER_TURN_END_CANDIDATE",
@@ -838,17 +882,20 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         epoch: int,
         token: CancellationToken,
     ) -> bool:
-        request_id = self._tts_request_id(segment)
+        active_segment = segment
+        request_id = self._tts_request_id(active_segment)
         published_any = False
         while True:
             try:
-                stream = await self._start_tts_stream(segment, request_id)
+                if token.is_cancelled() or not self.generation_clock.is_current(epoch):
+                    return False
+                stream = await self._start_tts_stream(active_segment, request_id)
                 async for raw_chunk in _iterate_maybe_async(stream):
                     if token.is_cancelled() or not self.generation_clock.is_current(epoch):
                         return False
                     chunk = self._tag_audio(
                         raw_chunk,
-                        segment,
+                        active_segment,
                         request_id,
                         self.playback.active_playback_attempt_id,
                     )
@@ -868,13 +915,43 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                         on_restart=self._restart_tts_worker,
                     )
                 if terminal is True and not published_any:
+                    if token.is_cancelled() or not self.generation_clock.is_current(epoch):
+                        return False
+                    checkpoint_segment = self._checkpoint_unplayed_segment(segment)
+                    if checkpoint_segment is None:
+                        await self._handle_terminal_tts_failure(segment, exc, terminal)
+                        return False
+                    active_segment = checkpoint_segment
+                    request_id = self._tts_request_id(active_segment)
                     continue
                 await self._handle_terminal_tts_failure(segment, exc, terminal)
                 return False
 
     async def _restart_tts_worker(self, _error: BaseException, _restart_count: int) -> None:
+        if self._tts_recovery is not None:
+            replacement = self._tts_recovery()
+            if inspect.isawaitable(replacement):
+                replacement = await replacement
+            if replacement is not None:
+                self.tts = replacement
+            await self._reset_provider(self.tts)
+            return
         await self._close_tts_runtime()
         await self._reset_provider(self.tts)
+
+    def _checkpoint_unplayed_segment(self, segment: TextSegment) -> TextSegment | None:
+        if (
+            segment.response_id != self.current_response_id
+            or segment.generation_epoch != self.generation_epoch
+        ):
+            return None
+        checkpoint = self.checkpoints.get(segment.response_id or "")
+        if checkpoint is None or checkpoint.archived or not checkpoint.resumable:
+            return None
+        saved = checkpoint.segments.get(segment.segment_id)
+        if saved is None or not saved.text or saved.sample_count != 0:
+            return None
+        return replace(segment, text=saved.text)
 
     async def _handle_terminal_tts_failure(
         self,
@@ -1083,12 +1160,18 @@ class ProductionRealtimeRuntimeFactory:
         *,
         prompt_builder: Callable[[str], str] | None = None,
         session_options: Mapping[str, Any] | None = None,
+        memory_manager: ModelManager | None = None,
     ) -> None:
         self._resource_builder = resource_builder
         self._session_builder = session_builder
         self._resources: dict[str, Any] | None = None
         self.prompt_builder = prompt_builder or _default_prompt_builder
         self.session_options = dict(session_options or {})
+        self._memory_manager = memory_manager
+
+    @property
+    def memory_diagnostics(self) -> dict[str, Any] | None:
+        return self._memory_manager.diagnostics() if self._memory_manager is not None else None
 
     def __call__(self, session_id: str) -> ServerRealtimeSessionRuntime:
         resources = self._resources
@@ -1102,6 +1185,7 @@ class ProductionRealtimeRuntimeFactory:
             tts=components["tts"],
             asr=components.get("asr"),
             turn=components.get("turn"),
+            tts_recovery=components.get("tts_recovery"),
             policy_engine=components.get("policy_engine"),
             interpretation_translator=components.get("interpretation_translator"),
             prompt_builder=self.prompt_builder,
@@ -1112,8 +1196,11 @@ class ProductionRealtimeRuntimeFactory:
         resources = self._resources
         if resources is None:
             return
-        for resource in resources.values():
+        self._resources = None
+        for name, resource in resources.items():
             await _close_runtime_resource(resource)
+            if self._memory_manager is not None:
+                self._memory_manager.release(name)
 
 
 def build_production_runtime_factory(
@@ -1141,31 +1228,49 @@ def build_production_runtime_factory(
             int(output_config.get("channels", 1)),
         )
 
-    def resource_builder() -> dict[str, Any]:
-        resources: dict[str, Any] = {}
-        for name in ("asr", "turn", "policy", "llm", "tts", "translation"):
-            profile = effective.get(name)
-            if not profile:
-                continue
+    def load_resource(name: str, profile: Mapping[str, Any]) -> Any:
+        requested_bytes = _profile_int(profile, "estimated_vram_bytes", default=0)
+        overhead_bytes = {
+            key: int(value)
+            for key, value in dict(profile.get("vram_overhead_bytes", {})).items()
+        }
+        loaded = None
+        try:
             if memory_manager is not None:
-                requested_bytes = _profile_int(
-                    profile,
-                    "estimated_vram_bytes",
-                    default=0,
+                memory_manager.reserve(
+                    name,
+                    requested_bytes=requested_bytes,
+                    overhead_bytes=overhead_bytes,
                 )
-                overhead_bytes = dict(profile.get("vram_overhead_bytes", {}))
-                if requested_bytes or overhead_bytes:
-                    memory_manager.reserve(
-                        name,
-                        requested_bytes=requested_bytes,
-                        overhead_bytes={key: int(value) for key, value in overhead_bytes.items()},
-                    )
             loaded = loaders[name](profile)
             if memory_manager is not None:
-                used_bytes = _profile_int(profile, "loaded_vram_bytes", default=requested_bytes)
-                if requested_bytes or used_bytes:
-                    memory_manager.record_loaded(name, used_bytes=used_bytes)
-            resources[name] = _SharedRuntimeBoundary(loaded)
+                memory_manager.record_loaded(
+                    name,
+                    used_bytes=_profile_int(
+                        profile, "loaded_vram_bytes", default=requested_bytes
+                    ),
+                )
+            return loaded
+        except Exception:
+            if loaded is not None:
+                _close_runtime_resource_now(loaded)
+            if memory_manager is not None:
+                memory_manager.release(name)
+            raise
+
+    def resource_builder() -> dict[str, Any]:
+        resources: dict[str, Any] = {}
+        try:
+            for name in ("asr", "turn", "policy", "llm", "tts", "translation"):
+                profile = effective.get(name)
+                if profile:
+                    resources[name] = _SharedRuntimeBoundary(load_resource(name, profile))
+        except Exception:
+            for loaded_name, resource in resources.items():
+                _close_runtime_resource_now(resource)
+                if memory_manager is not None:
+                    memory_manager.release(loaded_name)
+            raise
         return resources
 
     def session_builder(resources: dict[str, Any]) -> dict[str, Any]:
@@ -1204,12 +1309,27 @@ def build_production_runtime_factory(
                 device=translation_profile.get("device", "cuda"),
                 options=translation_profile.get("options"),
             )
+        async def recover_tts() -> Any:
+            boundary = resources["tts"]
+
+            def reload_worker() -> Any:
+                if memory_manager is not None:
+                    memory_manager.release("tts")
+                return load_resource("tts", effective["tts"])
+
+            await boundary.replace(reload_worker)
+            return create_tts_adapter(
+                effective["tts"], provider=_SessionRuntimeProxy(boundary)
+            )
+
+        components["tts_recovery"] = recover_tts
         return components
 
     return ProductionRealtimeRuntimeFactory(
         resource_builder,
         session_builder,
         session_options=resolved_session_options,
+        memory_manager=memory_manager,
     )
 
 
@@ -1348,27 +1468,77 @@ async def _close_runtime_resource(resource: Any) -> None:
             return
 
 
+def _close_runtime_resource_now(resource: Any) -> None:
+    """Begin cleanup at the synchronous model-loading boundary."""
+    if resource is None:
+        return
+    for candidate in (
+        resource,
+        getattr(resource, "runtime", None),
+        getattr(resource, "provider", None),
+        getattr(getattr(resource, "provider", None), "runtime", None),
+    ):
+        close = getattr(candidate, "close", None) if candidate is not None else None
+        if not callable(close):
+            continue
+        result = close()
+        if inspect.isawaitable(result):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(result)
+            else:
+                loop.create_task(result)
+        return
+
+
 def _build_model_manager(model_config: Mapping[str, Any]) -> ModelManager | None:
     runtime = dict(model_config.get("runtime", {}))
     budget = runtime.get("vram_budget_bytes")
     reserve = runtime.get("vram_reserve_bytes", 0)
     if budget is None:
-        return None
+        budget = _cuda_device_total_memory_bytes(model_config)
+        if budget is None:
+            return None
+    device = _cuda_device_from_config(model_config)
     return ModelManager(
         total_vram_bytes=int(budget),
         reserve_bytes=int(reserve),
-        measure_allocated_bytes=_measure_cuda_allocated_bytes,
+        measure_allocated_bytes=lambda: _measure_cuda_allocated_bytes(device),
     )
 
 
-def _measure_cuda_allocated_bytes() -> int:
+def _cuda_device_from_config(model_config: Mapping[str, Any]) -> str | None:
+    models = model_config.get("models", model_config)
+    for profile in models.values():
+        if isinstance(profile, Mapping):
+            device = str(profile.get("device", ""))
+            if device == "cuda" or device.startswith("cuda:"):
+                return device
+    return None
+
+
+def _cuda_device_total_memory_bytes(model_config: Mapping[str, Any]) -> int | None:
+    device = _cuda_device_from_config(model_config)
+    if device is None:
+        return None
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    return int(torch.cuda.get_device_properties(device).total_memory)
+
+
+def _measure_cuda_allocated_bytes(device: str | None = None) -> int:
     try:
         import torch
     except ImportError:
         return 0
     if not torch.cuda.is_available():
         return 0
-    return int(torch.cuda.memory_allocated())
+    return int(torch.cuda.memory_allocated(device))
 
 
 def _profile_int(profile: Mapping[str, Any], key: str, *, default: int = 0) -> int:

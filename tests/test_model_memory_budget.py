@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from src.model_runtime.manager import ModelManager, ModelMemoryBudgetError
 
@@ -39,6 +40,64 @@ class ModelMemoryBudgetTests(unittest.TestCase):
         self.assertEqual(diagnostics["models"]["qwen"]["after_bytes"], 38 * GIB)
         self.assertEqual(diagnostics["models"]["qwen"]["requested_bytes"], 12 * GIB)
         self.assertEqual(diagnostics["models"]["qwen"]["overhead_bytes"]["kv_cache"], 4 * GIB)
+
+    def test_pending_reservations_are_atomic_and_cannot_overcommit(self):
+        """Catches concurrent planned loads both passing against the same headroom."""
+        manager = ModelManager(total_vram_bytes=100)
+
+        def reserve(name):
+            try:
+                manager.reserve(name, requested_bytes=60)
+                return "reserved"
+            except ModelMemoryBudgetError:
+                return "rejected"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(reserve, ("first", "second")))
+
+        self.assertEqual(sorted(outcomes), ["rejected", "reserved"])
+        self.assertEqual(manager.diagnostics()["reserved_bytes"], 60)
+
+    def test_release_returns_loaded_and_pending_capacity(self):
+        """Catches closed or failed resources permanently leaking budget."""
+        manager = ModelManager(total_vram_bytes=100)
+        manager.reserve("first", requested_bytes=60)
+
+        self.assertTrue(manager.release("first"))
+        manager.reserve("second", requested_bytes=60)
+
+        self.assertEqual(manager.diagnostics()["reserved_bytes"], 60)
+        self.assertFalse(manager.release("missing"))
+
+    def test_record_loaded_uses_measured_cuda_delta(self):
+        """Catches production accounting trusting profile estimates after load."""
+        snapshots = iter((10, 45))
+        manager = ModelManager(
+            total_vram_bytes=100,
+            measure_allocated_bytes=lambda: next(snapshots),
+        )
+        manager.reserve("qwen", requested_bytes=20)
+
+        record = manager.record_loaded("qwen")
+
+        self.assertEqual(record["used_bytes"], 35)
+        self.assertEqual(manager.diagnostics()["loaded_bytes"], 35)
+        self.assertEqual(manager.diagnostics()["reserved_bytes"], 0)
+
+    def test_measured_overage_is_rejected_after_load(self):
+        """Catches a model whose real CUDA delta exceeds the safe budget."""
+        snapshots = iter((10, 95))
+        manager = ModelManager(
+            total_vram_bytes=80,
+            reserve_bytes=5,
+            measure_allocated_bytes=lambda: next(snapshots),
+        )
+        manager.reserve("qwen", requested_bytes=20)
+
+        with self.assertRaises(ModelMemoryBudgetError):
+            manager.record_loaded("qwen")
+
+        self.assertEqual(manager.diagnostics()["loaded_bytes"], 0)
 
 
 if __name__ == "__main__":

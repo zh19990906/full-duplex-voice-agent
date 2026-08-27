@@ -17,6 +17,7 @@ export const EVENT_TYPES = Object.freeze([
   "stop_response",
   "set_epoch",
   "playback_failed",
+  "llm_failed",
   "tts_failed",
   "worker_terminal",
 ]);
