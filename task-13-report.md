@@ -59,6 +59,21 @@
   - profile-aware default X2 loader arguments
   - bounded default turn profile shape
 
+## Review Fix Follow-up Round 3
+
+- Closed the idle-control TOCTOU race in the shared runtime boundary.
+- Control forwarding now has two explicit paths:
+  - if the caller is the current active owner, control is forwarded out-of-band immediately
+  - if the boundary appears idle, control acquires the operation lock, rechecks owner while holding it, executes fully, then releases so no new operation can start in between
+- If another owner is active, the waiting session's control request is rejected.
+- Kept lock acquisition order consistent across owner checks and operation serialization to avoid deadlock.
+- Extended regressions to cover:
+  - deterministic idle-cancel race against a fresh generate
+  - deterministic idle-reset race against a fresh generate
+  - concurrent owner cancel while a stream still holds the operation lock
+  - waiting-session control rejection while another owner is active
+  - owner cleanup after control-path exceptions
+
 ## Verification
 
 Targeted Task 13 tests:
@@ -91,7 +106,7 @@ Full Python suite:
 python3 -m unittest discover -s tests -p 'test_*.py' -q
 ```
 
-Result: PASS (`Ran 489 tests ... OK`)
+Result: PASS (`Ran 494 tests ... OK`)
 
 Frontend full suite:
 

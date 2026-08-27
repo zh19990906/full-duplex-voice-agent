@@ -173,6 +173,49 @@ class _BlockingRuntime:
         self.reset_calls += 1
 
 
+class _IdleControlRaceRuntime:
+    def __init__(self):
+        self.control_started = asyncio.Event()
+        self.allow_control_finish = asyncio.Event()
+        self.operation_started = asyncio.Event()
+        self.cancel_calls = []
+        self.reset_calls = 0
+        self.generate_calls = []
+
+    async def cancel(self, *args):
+        self.cancel_calls.append(args)
+        self.control_started.set()
+        await self.allow_control_finish.wait()
+
+    async def reset(self):
+        self.reset_calls += 1
+        self.control_started.set()
+        await self.allow_control_finish.wait()
+
+    async def generate(self, prompt, **_options):
+        self.generate_calls.append(prompt)
+        self.operation_started.set()
+        return f"generated:{prompt}"
+
+
+class _ExplodingControlRuntime:
+    def __init__(self):
+        self.operation_started = asyncio.Event()
+        self.operation_release = asyncio.Event()
+
+    async def stream_tokens(self, _prompt, **_options):
+        self.operation_started.set()
+        await self.operation_release.wait()
+        yield {"text": "done", "is_final": True}
+
+    async def cancel(self, *_args):
+        self.operation_release.set()
+        raise RuntimeError("cancel boom")
+
+    async def generate(self, prompt, **_options):
+        return prompt
+
+
 class _LoaderCapture:
     def __init__(self):
         self.calls = []
@@ -255,6 +298,104 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         self.assertEqual(runtime.reset_calls, 1)
+
+    async def test_idle_cancel_blocks_new_operation_until_control_completes(self):
+        runtime = _IdleControlRaceRuntime()
+        boundary = _SharedRuntimeBoundary(runtime)
+        stale = _SessionRuntimeProxy(boundary)
+        fresh = _SessionRuntimeProxy(boundary)
+
+        cancel_task = asyncio.create_task(stale.cancel("stale-request"))
+        await runtime.control_started.wait()
+        generate_task = asyncio.create_task(fresh.generate("fresh"))
+        await asyncio.sleep(0)
+
+        self.assertFalse(runtime.operation_started.is_set())
+        self.assertEqual(runtime.cancel_calls, [("stale-request",)])
+
+        runtime.allow_control_finish.set()
+        cancel_result = await cancel_task
+        generate_result = await generate_task
+
+        self.assertTrue(cancel_result)
+        self.assertEqual(generate_result, "generated:fresh")
+        self.assertEqual(runtime.generate_calls, ["fresh"])
+
+    async def test_idle_reset_blocks_new_operation_until_control_completes(self):
+        runtime = _IdleControlRaceRuntime()
+        boundary = _SharedRuntimeBoundary(runtime)
+        stale = _SessionRuntimeProxy(boundary)
+        fresh = _SessionRuntimeProxy(boundary)
+
+        reset_task = asyncio.create_task(boundary.control(stale, "reset"))
+        await runtime.control_started.wait()
+        generate_task = asyncio.create_task(fresh.generate("fresh"))
+        await asyncio.sleep(0)
+
+        self.assertFalse(runtime.operation_started.is_set())
+        self.assertEqual(runtime.reset_calls, 1)
+
+        runtime.allow_control_finish.set()
+        reset_result = await reset_task
+        generate_result = await generate_task
+
+        self.assertTrue(reset_result)
+        self.assertEqual(generate_result, "generated:fresh")
+
+    async def test_owner_cancel_still_forwards_while_stream_holds_operation_lock(self):
+        runtime = _BlockingRuntime()
+        boundary = _SharedRuntimeBoundary(runtime)
+        owner = _SessionRuntimeProxy(boundary)
+
+        async def consume():
+            return [chunk async for chunk in owner.stream_tokens("hello")]
+
+        task = asyncio.create_task(consume())
+        await runtime.active.wait()
+
+        cancel_task = asyncio.create_task(owner.cancel("owner-request"))
+        await asyncio.sleep(0)
+
+        self.assertEqual(runtime.cancel_calls, [("owner-request",)])
+        await task
+        self.assertTrue(await cancel_task)
+
+    async def test_waiting_session_control_is_rejected_while_owner_active(self):
+        runtime = _BlockingRuntime()
+        boundary = _SharedRuntimeBoundary(runtime)
+        owner = _SessionRuntimeProxy(boundary)
+        waiting = _SessionRuntimeProxy(boundary)
+
+        async def consume():
+            return [chunk async for chunk in owner.stream_tokens("hello")]
+
+        task = asyncio.create_task(consume())
+        await runtime.active.wait()
+
+        self.assertFalse(await boundary.control(waiting, "reset"))
+        self.assertEqual(runtime.reset_calls, 0)
+
+        await owner.cancel()
+        await task
+
+    async def test_owner_is_cleared_after_control_exception(self):
+        runtime = _ExplodingControlRuntime()
+        boundary = _SharedRuntimeBoundary(runtime)
+        owner = _SessionRuntimeProxy(boundary)
+        fresh = _SessionRuntimeProxy(boundary)
+
+        async def consume():
+            return [chunk async for chunk in owner.stream_tokens("hello")]
+
+        task = asyncio.create_task(consume())
+        await runtime.operation_started.wait()
+
+        with self.assertRaisesRegex(RuntimeError, "cancel boom"):
+            await owner.cancel()
+        await task
+
+        result = await fresh.generate("fresh")
+        self.assertEqual(result, "fresh")
 
     async def test_production_factory_creates_real_shape_session_from_injected_loaded_runtimes(self):
         shared = {

@@ -234,15 +234,17 @@ class _SharedRuntimeBoundary:
     ) -> bool:
         async with self._control_lock:
             active_owner = await self._get_active_owner()
-            if active_owner is not None and active_owner is not owner:
+            if active_owner is owner:
+                return await self._invoke_control(method_name, *args, **kwargs)
+            if active_owner is not None:
                 return False
-            method = getattr(self.runtime, method_name, None)
-            if not callable(method):
-                return False
-            result = method(*args, **kwargs)
-            if inspect.isawaitable(result):
-                await result
-            return True
+            async with self._operation_lock:
+                active_owner = await self._get_active_owner()
+                if active_owner is owner:
+                    return await self._invoke_control(method_name, *args, **kwargs)
+                if active_owner is not None:
+                    return False
+                return await self._invoke_control(method_name, *args, **kwargs)
 
     async def close(self) -> None:
         close = getattr(self.runtime, "close", None)
@@ -264,6 +266,15 @@ class _SharedRuntimeBoundary:
         async with self._owner_lock:
             if self._active_owner is owner:
                 self._active_owner = None
+
+    async def _invoke_control(self, method_name: str, *args: Any, **kwargs: Any) -> bool:
+        method = getattr(self.runtime, method_name, None)
+        if not callable(method):
+            return False
+        result = method(*args, **kwargs)
+        if inspect.isawaitable(result):
+            await result
+        return True
 
 
 class _SessionRuntimeProxy:
@@ -305,8 +316,7 @@ class _SessionRuntimeProxy:
         except RuntimeError:
             asyncio.run(self.runtime.control(self, "reset"))
             return None
-        loop.create_task(self.runtime.control(self, "reset"))
-        return None
+        return loop.create_task(self.runtime.control(self, "reset"))
 
 
 class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
