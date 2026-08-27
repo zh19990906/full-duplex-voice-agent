@@ -89,8 +89,14 @@ def build_acceptance_payload(
     environment: dict[str, Any] | None = None,
     audio: str | None = None,
     timeline: list[dict[str, Any]] | None = None,
+    _evidence_capability: object | None = None,
 ) -> dict[str, Any]:
-    result = evaluate_acceptance(metrics, label=label, provenance=provenance)
+    result = evaluate_acceptance(
+        metrics,
+        label=label,
+        provenance=provenance,
+        _evidence_capability=_evidence_capability,
+    )
     payload: dict[str, Any] = {
         "label": result.label,
         "passed": result.passed,
@@ -195,6 +201,7 @@ def _payload_from_evidence(
         environment=evidence.environment,
         audio=audio,
         timeline=[entry.to_dict() for entry in evidence.timeline.entries],
+        _evidence_capability=evidence._capability,
     )
 
 

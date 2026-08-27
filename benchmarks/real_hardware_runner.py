@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+import base64
+import binascii
+from dataclasses import dataclass, field
 import inspect
 import os
 import resource
@@ -38,6 +40,7 @@ from .metrics import (
     AcceptanceProvenance,
     EvidenceSource,
     METRIC_EVENTS,
+    _issue_completed_capture,
     calculate_metrics,
 )
 from .report import HardwareBenchmarkReport
@@ -191,6 +194,7 @@ class AcceptanceEvidence:
     environment: dict[str, Any]
     provenance: AcceptanceProvenance
     timeline: BenchmarkTimeline
+    _capability: object | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -236,12 +240,51 @@ def _benchmark_event_name(name: str) -> str | None:
         "audio_frame_accepted": "audio_received",
         "transcript": "first_asr_partial",
         "token": "first_llm_token",
-        "audio_chunk": "first_audio_chunk",
-        "first_playable_audio": "first_audio_chunk",
     }
     if normalized in aliases:
         return aliases[normalized]
     return normalized if normalized in _KNOWN_CAPTURE_EVENTS else None
+
+
+def _event_value(event: Mapping[str, Any], name: str) -> Any:
+    payload = event.get("payload")
+    if name in event:
+        return event[name]
+    return payload.get(name) if isinstance(payload, Mapping) else None
+
+
+def _has_nonempty_pcm(event: Mapping[str, Any]) -> bool:
+    for name in ("audio_data", "pcm"):
+        value = _event_value(event, name)
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bool(value)
+        if isinstance(value, (list, tuple)):
+            return bool(value)
+    for name in ("audio_b64", "pcm_b64"):
+        value = _event_value(event, name)
+        if isinstance(value, str) and value:
+            try:
+                return bool(base64.b64decode(value, validate=True))
+            except (binascii.Error, ValueError):
+                return False
+    return False
+
+
+def _is_playable_audio_event(event: Mapping[str, Any]) -> bool:
+    response_id = _event_value(event, "response_id")
+    identities = tuple(
+        _event_value(event, name)
+        for name in ("generation_epoch", "segment_id", "playback_attempt_id")
+    )
+    return (
+        isinstance(response_id, str)
+        and bool(response_id)
+        and all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in identities
+        )
+        and _has_nonempty_pcm(event)
+    )
 
 
 def _record_capture_event(
@@ -249,7 +292,11 @@ def _record_capture_event(
     event: Mapping[str, Any],
     clock: Callable[[], float],
 ) -> str | None:
-    name = _benchmark_event_name(str(event.get("event", event.get("name", ""))))
+    raw_name = str(event.get("event", event.get("name", ""))).strip().lower()
+    if raw_name in {"audio_chunk", "first_playable_audio", "first_audio_chunk"}:
+        name = "first_audio_chunk" if _is_playable_audio_event(event) else None
+    else:
+        name = _benchmark_event_name(raw_name)
     if name is None:
         return None
     timeline.record(name, _event_timestamp(event, clock))
@@ -264,6 +311,7 @@ def _observe_task13_turn_end(
     runtime: Any,
     timeline: BenchmarkTimeline,
     clock: Callable[[], float],
+    observed_event: asyncio.Event,
 ) -> Callable[[], None]:
     """Observe the fused Task 13 turn boundary without changing runtime policy."""
 
@@ -278,6 +326,7 @@ def _observe_task13_turn_end(
             and timeline.first("turn_end") is None
         ):
             timeline.record("turn_end", clock())
+            observed_event.set()
         return original(state, candidate)
 
     try:
@@ -301,13 +350,20 @@ class RecordedAudioRealtimeDriver:
         sleep: Callable[[float], Awaitable[None] | None] = asyncio.sleep,
         drain_timeout: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
+        trailing_silence_frames: int = 50,
     ) -> None:
         if drain_timeout <= 0:
             raise ValueError("drain_timeout must be positive")
+        if (
+            isinstance(trailing_silence_frames, bool)
+            or not 0 < trailing_silence_frames <= 250
+        ):
+            raise ValueError("trailing_silence_frames must be between 1 and 250")
         self.runtime_factory = runtime_factory or _acceptance_runtime_factory
         self.sleep = sleep
         self.drain_timeout = float(drain_timeout)
         self.clock = clock
+        self.trailing_silence_frames = trailing_silence_frames
 
     async def run(self, audio_path: str | Path, *, profile: str) -> AcceptanceEvidence:
         path = Path(audio_path)
@@ -317,13 +373,17 @@ class RecordedAudioRealtimeDriver:
         runtime = await _maybe_await(factory(run_id))
         timeline = BenchmarkTimeline()
         first_audio = asyncio.Event()
-        restore_turn_observer = _observe_task13_turn_end(runtime, timeline, self.clock)
+        turn_ended = asyncio.Event()
+        restore_turn_observer = _observe_task13_turn_end(runtime, timeline, self.clock, turn_ended)
 
         async def collect_events() -> None:
             async for event in runtime.events():
                 if not isinstance(event, Mapping):
                     continue
-                if _record_capture_event(timeline, event, self.clock) == "first_audio_chunk":
+                recorded = _record_capture_event(timeline, event, self.clock)
+                if recorded == "turn_end":
+                    turn_ended.set()
+                if recorded == "first_audio_chunk":
                     first_audio.set()
 
         collector: asyncio.Task[None] | None = None
@@ -335,7 +395,10 @@ class RecordedAudioRealtimeDriver:
             timeline.record("audio_received", self.clock())
             frame_duration = PCM16_FRAME_SAMPLES / PCM16_SAMPLE_RATE
             capture_started = self.clock()
-            for sequence, pcm in enumerate(frames):
+            capture_frames = frames + (
+                b"\x00" * PCM16_FRAME_BYTES,
+            ) * self.trailing_silence_frames
+            for sequence, pcm in enumerate(capture_frames):
                 await runtime.accept_audio_frame(
                     RealtimeAudioFrame(
                         header=AudioFrameHeader(
@@ -346,13 +409,16 @@ class RecordedAudioRealtimeDriver:
                     )
                 )
                 await asyncio.sleep(0)
-                if sequence + 1 < len(frames):
+                if sequence + 1 < len(capture_frames):
                     await _maybe_await(self.sleep(frame_duration))
             flush = getattr(runtime, "flush", None)
             if callable(flush):
                 await _maybe_await(flush())
-            if timeline.first("turn_end") is None:
-                timeline.record("turn_end", self.clock())
+            if not turn_ended.is_set():
+                try:
+                    await asyncio.wait_for(turn_ended.wait(), timeout=self.drain_timeout)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("recorded audio did not produce a fused turn_end") from exc
 
             audio_waiter = asyncio.create_task(first_audio.wait())
             done, pending = await asyncio.wait(
@@ -385,19 +451,22 @@ class RecordedAudioRealtimeDriver:
                 if callable(close_factory):
                     await _maybe_await(close_factory())
 
+        metrics = calculate_metrics(timeline)
+        provenance = AcceptanceProvenance.runner_capture(
+            EvidenceSource.RECORDED_AUDIO_REALTIME,
+            run_id=run_id,
+        )
         return AcceptanceEvidence(
-            metrics=calculate_metrics(timeline),
+            metrics=metrics,
             environment={
                 "profile": profile,
                 "audio": str(path.resolve()),
                 "sample_rate": PCM16_SAMPLE_RATE,
                 "channels": PCM16_MONO_CHANNELS,
             },
-            provenance=AcceptanceProvenance.runner_capture(
-                EvidenceSource.RECORDED_AUDIO_REALTIME,
-                run_id=run_id,
-            ),
+            provenance=provenance,
             timeline=timeline,
+            _capability=_issue_completed_capture(provenance.source, provenance.run_id),
         )
 
     @staticmethod
@@ -456,14 +525,16 @@ class BrowserHeadsetAcceptanceDriver:
         environment = payload.get("environment", {})
         if not isinstance(environment, Mapping):
             raise ValueError("browser/headset environment must be an object")
+        provenance = AcceptanceProvenance.runner_capture(
+            EvidenceSource.BROWSER_HEADSET,
+            run_id=uuid.uuid4().hex,
+        )
         return AcceptanceEvidence(
             metrics=metrics,
             environment=dict(environment),
-            provenance=AcceptanceProvenance.runner_capture(
-                EvidenceSource.BROWSER_HEADSET,
-                run_id=uuid.uuid4().hex,
-            ),
+            provenance=provenance,
             timeline=timeline,
+            _capability=_issue_completed_capture(provenance.source, provenance.run_id),
         )
 
 

@@ -64,27 +64,29 @@ class RealtimeAcceptanceTests(unittest.TestCase):
         self.assertIn("model_integration_requires_recorded_audio_runner", imported_model.failures)
         self.assertIn("hardware_e2e_requires_browser_headset_runner", wrong_driver.failures)
 
-    def test_matching_runner_provenance_allows_real_tiers_to_be_evaluated(self):
-        """Catches provenance checks that reject captures from the required driver."""
+    def test_constructed_matching_provenance_cannot_mint_high_tier_evidence(self):
+        """Catches public provenance fields acting as a high-tier capability."""
         model = evaluate_acceptance(
             _PASSING_METRICS,
             label="model-integration",
-            provenance=AcceptanceProvenance.runner_capture(
-                EvidenceSource.RECORDED_AUDIO_REALTIME,
-                run_id="recorded-run-2",
+            provenance=AcceptanceProvenance(
+                source=EvidenceSource.RECORDED_AUDIO_REALTIME,
+                run_id="forged-recorded-run",
+                producer=AcceptanceProvenance.RUNNER_PRODUCER,
             ),
         )
         hardware = evaluate_acceptance(
             _PASSING_METRICS,
             label="hardware-e2e",
-            provenance=AcceptanceProvenance.runner_capture(
-                EvidenceSource.BROWSER_HEADSET,
-                run_id="hardware-run-1",
+            provenance=AcceptanceProvenance(
+                source=EvidenceSource.BROWSER_HEADSET,
+                run_id="forged-hardware-run",
+                producer=AcceptanceProvenance.RUNNER_PRODUCER,
             ),
         )
 
-        self.assertTrue(model.passed)
-        self.assertTrue(hardware.passed)
+        self.assertFalse(model.passed)
+        self.assertFalse(hardware.passed)
 
     def test_first_audio_latency_starts_at_confirmed_turn_end(self):
         """Catches TTS-only latency that omits policy and LLM time before the first token."""
@@ -166,8 +168,8 @@ class RealtimeAcceptanceCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["passed"])
         self.assertIsNone(payload["provenance"])
 
-    async def test_model_integration_audio_is_run_through_recorded_audio_driver(self):
-        """Catches --audio being reported without executing the realtime capture driver."""
+    async def test_plain_driver_return_value_cannot_mint_model_integration_evidence(self):
+        """Catches injected drivers promoting a directly constructed evidence object."""
         calls = []
         timeline = BenchmarkTimeline()
         driver = _StaticAcceptanceDriver(
@@ -198,7 +200,11 @@ class RealtimeAcceptanceCliTests(unittest.IsolatedAsyncioTestCase):
             recorded_audio_driver=driver,
         )
 
-        self.assertTrue(payload["passed"])
+        self.assertFalse(payload["passed"])
+        self.assertIn(
+            "model_integration_requires_recorded_audio_runner",
+            payload["failures"],
+        )
         self.assertEqual(calls, [("recorded", Path("/captures/turn.wav"), "local_gpu")])
         self.assertEqual(
             payload["provenance"]["source"],

@@ -83,6 +83,46 @@ class AcceptanceProvenance:
         }
 
 
+class _AcceptanceEvidenceCapability:
+    """Opaque in-process proof that a runner completed a capture."""
+
+    __slots__ = ("source", "run_id", "_seal")
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("acceptance evidence capabilities are runner-issued")
+
+
+def _capability_authority():
+    seal = object()
+
+    def issue(source: EvidenceSource, run_id: str) -> _AcceptanceEvidenceCapability:
+        capability = object.__new__(_AcceptanceEvidenceCapability)
+        capability.source = source
+        capability.run_id = run_id
+        capability._seal = seal
+        return capability
+
+    def matches(
+        capability: object | None,
+        provenance: AcceptanceProvenance | None,
+        source: EvidenceSource,
+    ) -> bool:
+        return (
+            isinstance(capability, _AcceptanceEvidenceCapability)
+            and capability._seal is seal
+            and capability.source is source
+            and provenance is not None
+            and provenance.source is source
+            and provenance.run_id == capability.run_id
+            and provenance.producer == AcceptanceProvenance.RUNNER_PRODUCER
+        )
+
+    return issue, matches
+
+
+_issue_completed_capture, _completed_capture_matches = _capability_authority()
+
+
 @dataclass(frozen=True)
 class AcceptanceResult:
     label: str
@@ -120,6 +160,7 @@ def evaluate_acceptance(
     *,
     label: str,
     provenance: AcceptanceProvenance | None = None,
+    _evidence_capability: object | None = None,
 ) -> AcceptanceResult:
     """Evaluate V1 hard gates for an explicitly labeled evidence tier."""
 
@@ -138,15 +179,17 @@ def evaluate_acceptance(
             continue
         if value > limit:
             failures.append(metric_name)
-    runner_source = (
-        provenance.source
-        if provenance is not None
-        and provenance.producer == AcceptanceProvenance.RUNNER_PRODUCER
-        else None
-    )
-    if label == "model-integration" and runner_source is not EvidenceSource.RECORDED_AUDIO_REALTIME:
+    if label == "model-integration" and not _completed_capture_matches(
+        _evidence_capability,
+        provenance,
+        EvidenceSource.RECORDED_AUDIO_REALTIME,
+    ):
         failures.append("model_integration_requires_recorded_audio_runner")
-    if label == "hardware-e2e" and runner_source is not EvidenceSource.BROWSER_HEADSET:
+    if label == "hardware-e2e" and not _completed_capture_matches(
+        _evidence_capability,
+        provenance,
+        EvidenceSource.BROWSER_HEADSET,
+    ):
         failures.append("hardware_e2e_requires_browser_headset_runner")
     return AcceptanceResult(
         label=label,

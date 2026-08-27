@@ -14,7 +14,7 @@ from benchmarks.real_hardware_runner import (
     RealHardwareBenchmarkRunner,
     validate_hardware,
 )
-from benchmarks.metrics import EvidenceSource
+from benchmarks.metrics import EvidenceSource, evaluate_acceptance
 from src.realtime.audio_ingress import RealtimeAudioFrame
 from benchmarks.report import HardwareBenchmarkReport
 
@@ -96,7 +96,15 @@ class RecordingRealtimeRuntime:
     async def events(self):
         yield {"event": "turn_end", "server_timestamp": 1.0, "payload": {}}
         yield {"event": "token", "server_timestamp": 1.2, "payload": {}}
-        yield {"event": "audio_chunk", "server_timestamp": 1.5, "payload": {}}
+        yield {
+            "event": "audio_chunk",
+            "server_timestamp": 1.5,
+            "response_id": "response-1",
+            "generation_epoch": 1,
+            "segment_id": 0,
+            "playback_attempt_id": 1,
+            "payload": {"audio_data": b"\x01\x00"},
+        }
 
 
 class RecordingRuntimeFactory:
@@ -141,7 +149,48 @@ class ConfirmedTurnRuntime(RecordingRealtimeRuntime):
 
     async def events(self):
         yield {"event": "token", "server_timestamp": 1.2, "payload": {}}
-        yield {"event": "audio_chunk", "server_timestamp": 2.0, "payload": {}}
+        yield {
+            "event": "audio_chunk",
+            "server_timestamp": 2.0,
+            "response_id": "response-1",
+            "generation_epoch": 1,
+            "segment_id": 0,
+            "playback_attempt_id": 1,
+            "payload": {"audio_data": b"\x01\x00"},
+        }
+
+
+class NoTurnEndRuntime(RecordingRealtimeRuntime):
+    async def events(self):
+        yield {"event": "token", "server_timestamp": 1.2, "payload": {}}
+
+
+class SentinelAudioRuntime(RecordingRealtimeRuntime):
+    async def events(self):
+        yield {"event": "turn_end", "server_timestamp": 1.0, "payload": {}}
+        yield {
+            "event": "audio_chunk",
+            "server_timestamp": 1.1,
+            "response_id": "response-1",
+            "generation_epoch": 1,
+            "segment_id": 0,
+            "playback_attempt_id": 1,
+            "payload": {"audio_data": b""},
+        }
+        yield {
+            "event": "audio_chunk",
+            "server_timestamp": 1.2,
+            "payload": {"audio_data": b"\x01\x00"},
+        }
+        yield {
+            "event": "audio_chunk",
+            "server_timestamp": 1.5,
+            "response_id": "response-1",
+            "generation_epoch": 1,
+            "segment_id": 0,
+            "playback_attempt_id": 1,
+            "payload": {"audio_data": b"\x01\x00"},
+        }
 
 
 class RealHardwareBenchmarkTests(unittest.IsolatedAsyncioTestCase):
@@ -232,6 +281,7 @@ class RealHardwareBenchmarkTests(unittest.IsolatedAsyncioTestCase):
                 runtime_factory=lambda _profile: factory,
                 sleep=lambda delay: sleep_delays.append(delay),
                 drain_timeout=0.01,
+                trailing_silence_frames=2,
             )
 
             evidence = await driver.run(audio_path, profile="local_gpu")
@@ -239,9 +289,10 @@ class RealHardwareBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runtime.started)
         self.assertTrue(runtime.closed)
         self.assertTrue(factory.closed)
-        self.assertEqual([frame.header.sequence for frame in runtime.frames], [0, 1])
+        self.assertEqual([frame.header.sequence for frame in runtime.frames], [0, 1, 2, 3])
+        self.assertEqual([frame.pcm for frame in runtime.frames[-2:]], [b"\x00" * 640] * 2)
         self.assertTrue(all(isinstance(frame, RealtimeAudioFrame) for frame in runtime.frames))
-        self.assertEqual(sleep_delays, [0.02])
+        self.assertEqual(sleep_delays, [0.02, 0.02, 0.02])
         self.assertEqual(evidence.provenance.source, EvidenceSource.RECORDED_AUDIO_REALTIME)
         self.assertEqual(evidence.metrics["first_audio_latency_ms"], 500.0)
 
@@ -262,12 +313,59 @@ class RealHardwareBenchmarkTests(unittest.IsolatedAsyncioTestCase):
                 sleep=lambda _delay: None,
                 drain_timeout=0.01,
                 clock=clock,
+                trailing_silence_frames=1,
             )
 
             evidence = await driver.run(audio_path, profile="local_gpu")
 
         self.assertEqual(evidence.timeline.first("turn_end").timestamp, 1.0)
         self.assertEqual(evidence.metrics["first_audio_latency_ms"], 1000.0)
+
+    async def test_recorded_audio_rejects_capture_without_fused_turn_end(self):
+        runtime = NoTurnEndRuntime()
+        factory = RecordingRuntimeFactory(runtime)
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "turn.wav"
+            with wave.open(str(audio_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16000)
+                output.writeframes(b"\x01\x00" * 320)
+            driver = RecordedAudioRealtimeDriver(
+                runtime_factory=lambda _profile: factory,
+                sleep=lambda _delay: None,
+                drain_timeout=0.01,
+                trailing_silence_frames=2,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "fused turn_end"):
+                await driver.run(audio_path, profile="local_gpu")
+
+        self.assertEqual(len(runtime.frames), 3)
+        self.assertTrue(runtime.closed)
+        self.assertTrue(factory.closed)
+
+    async def test_first_playable_audio_ignores_empty_and_identityless_chunks(self):
+        runtime = SentinelAudioRuntime()
+        factory = RecordingRuntimeFactory(runtime)
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "turn.wav"
+            with wave.open(str(audio_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16000)
+                output.writeframes(b"\x01\x00" * 320)
+            driver = RecordedAudioRealtimeDriver(
+                runtime_factory=lambda _profile: factory,
+                sleep=lambda _delay: None,
+                drain_timeout=0.01,
+                trailing_silence_frames=1,
+            )
+
+            evidence = await driver.run(audio_path, profile="local_gpu")
+
+        self.assertEqual(evidence.timeline.count("first_audio_chunk"), 1)
+        self.assertEqual(evidence.metrics["first_audio_latency_ms"], 500.0)
 
     async def test_browser_headset_driver_executes_driver_and_stamps_runner_provenance(self):
         """Catches hardware E2E reports produced without running the browser/headset driver."""
@@ -278,7 +376,15 @@ class RealHardwareBenchmarkTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "timeline": [
                     {"name": "turn_end", "timestamp": 2.0},
-                    {"name": "first_audio_chunk", "timestamp": 2.4},
+                    {
+                        "name": "first_audio_chunk",
+                        "timestamp": 2.4,
+                        "response_id": "response-1",
+                        "generation_epoch": 1,
+                        "segment_id": 0,
+                        "playback_attempt_id": 1,
+                        "pcm": [1, 0],
+                    },
                 ],
                 "metrics": {"resume_phrase_error_count": 0.0},
                 "environment": {"headset": "usb"},
@@ -290,6 +396,22 @@ class RealHardwareBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence.provenance.source, EvidenceSource.BROWSER_HEADSET)
         self.assertEqual(evidence.metrics["first_audio_latency_ms"], 400.0)
         self.assertEqual(evidence.environment["headset"], "usb")
+        result = evaluate_acceptance(
+            {
+                "duck_latency_ms": 90.0,
+                "interrupt_latency_ms": 200.0,
+                "backchannel_restore_latency_ms": 250.0,
+                "first_token_latency_ms": 700.0,
+                "first_audio_latency_ms": 400.0,
+                "first_translated_audio_latency_ms": 1900.0,
+                "stale_output_count": 0.0,
+                "resume_phrase_error_count": 1.0,
+            },
+            label="hardware-e2e",
+            provenance=evidence.provenance,
+            _evidence_capability=evidence._capability,
+        )
+        self.assertTrue(result.passed)
 
 
 if __name__ == "__main__":
