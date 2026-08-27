@@ -85,6 +85,53 @@ through the real Qwen and CosyVoice models. Binary microphone messages return a
 clear notice because the checked-in X2-Turn local API performs offline whole-file
 inference rather than streaming raw browser audio.
 
+## Realtime acceptance
+
+Use the acceptance CLI to evaluate a report with an explicit evidence label:
+
+```bash
+python3 scripts/run_realtime_acceptance.py --help
+```
+
+Accepted labels are `unit`, `simulated`, `model-integration`, and
+`hardware-e2e`. The CLI refuses to pass a `hardware-e2e` report unless it is
+explicitly marked as a real run and all required measurements are present.
+
+Recorded-audio model integration on the GPU server:
+
+```bash
+python3 scripts/run_realtime_acceptance.py \
+  --profile local_gpu \
+  --label model-integration \
+  --audio /home/X2-Turn/turn-demo/assets/sample_en.wav \
+  --report /tmp/realtime-model-integration.json
+```
+
+Real browser/headset acceptance on the target machine:
+
+```bash
+python3 scripts/run_realtime_acceptance.py \
+  --profile local_gpu \
+  --label hardware-e2e \
+  --explicit-real-run \
+  --report /tmp/realtime-hardware-e2e.json
+```
+
+Required V1 hard gates:
+
+- `duck_latency_ms <= 100`
+- `interrupt_latency_ms <= 250`
+- `backchannel_restore_latency_ms <= 300`
+- `first_token_latency_ms <= 800`
+- `first_audio_latency_ms <= 1500`
+- `first_translated_audio_latency_ms <= 2000`
+- `stale_output_count == 0`
+- `resume_phrase_error_count <= 1`
+
+GPU, headset, and 60-minute soak validation are external gates. Run them on the
+target deployment and record them separately; do not relabel synthetic or
+partial evidence as `hardware-e2e`.
+
 ## High Level Architecture
 
 ```

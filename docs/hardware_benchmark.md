@@ -40,6 +40,17 @@ Use `--json` for machine-readable output:
 python3 -m benchmarks.real_hardware_runner --json
 ```
 
+Evaluate a benchmark or recorded run against the Task 14 hard gates with an
+explicit evidence label:
+
+```bash
+python3 scripts/run_realtime_acceptance.py --help
+```
+
+Valid labels are `unit`, `simulated`, `model-integration`, and
+`hardware-e2e`. Only an explicit real browser/headset run with the required
+measurements may pass as `hardware-e2e`.
+
 The runner accepts a programmatic real-session hook that drives the existing
 audio/model runtime and records events on `BenchmarkTimeline`. Record these
 events to obtain latency metrics:
@@ -54,6 +65,30 @@ cancel_requested -> generation_cancelled
 
 Without a session hook, the runner reports only measured startup and process
 memory values; missing interaction metrics are omitted rather than fabricated.
+
+For recorded-audio model integration on the GPU server:
+
+```bash
+python3 scripts/run_realtime_acceptance.py \
+  --profile local_gpu \
+  --label model-integration \
+  --audio /home/X2-Turn/turn-demo/assets/sample_en.wav \
+  --report /tmp/realtime-model-integration.json
+```
+
+For real browser/headset validation:
+
+```bash
+python3 scripts/run_realtime_acceptance.py \
+  --profile local_gpu \
+  --label hardware-e2e \
+  --explicit-real-run \
+  --report /tmp/realtime-hardware-e2e.json
+```
+
+For the external 60-minute soak gate, keep the runtime on the real deployment
+for one hour and confirm there is no unbounded queue growth, restart loop, CUDA
+OOM, or stale audio. This gate is never inferred from synthetic or short runs.
 
 ## Validation failures
 
@@ -93,4 +128,3 @@ benchmark will not silently run a CUDA profile on CPU.
 The benchmark runner does not construct provider SDK objects. Inject the real
 provider resources through the deployment composition and inspect the
 provider/runtime error before rerunning the benchmark.
-

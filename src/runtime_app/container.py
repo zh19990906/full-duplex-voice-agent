@@ -22,10 +22,11 @@ from src.realtime.playback import PlaybackCoordinator
 from src.realtime.policy import PolicyRequest, SemanticPolicyEngine
 from src.realtime.response_pipeline import RealtimeResponsePipeline, ResponseStreamEnd
 from src.realtime.interpretation import TranslationSegment
+from src.realtime.supervisor import WorkerSupervisor, WorkerTerminalEvent
 from src.realtime.session_runtime import RealtimeSessionRuntime
 from src.realtime.session_state import ConversationMode
 from src.realtime.session_state import FloorState, ResponseState, SessionState
-from src.realtime.speech_fusion import SpeechEventFusion
+from src.realtime.speech_fusion import SpeechCandidateEvent, SpeechEventFusion
 from src.realtime.text_segmenter import LanguageAwareTextSegmenter, TextSegment
 from src.runtime.event_bus import EventBus
 from src.runtime.scheduler import RealtimeScheduler
@@ -38,6 +39,7 @@ from src.model_runtime.factory import (
     create_tts_adapter,
     create_turn_provider,
 )
+from src.model_runtime.manager import ModelManager
 
 
 class ApplicationContainer:
@@ -367,7 +369,9 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         self._generation_slot = ActiveTaskSlot()
         self._generation_token: CancellationToken | None = None
         self._assistant_last_text = ""
+        self._playback_failed = False
         self._sender_playback = PlaybackCoordinator(send_command=self._publish_command)
+        self._tts_supervisor = WorkerSupervisor("tts_worker", max_restarts=1)
         self._runtime_interpretation_sink = interpretation_sink or RuntimeBackedTranslationSink(self)
         super().__init__(
             session_id,
@@ -382,6 +386,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
 
     async def connect(self) -> None:
         self._connected += 1
+        await self._publish({"event": "session_snapshot", "payload": self.snapshot()})
 
     async def disconnect(self) -> None:
         self._connected = max(0, self._connected - 1)
@@ -471,14 +476,23 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
     async def _process_audio_frame(self, frame: RealtimeAudioFrame) -> None:
         transcript: TranscriptChunk | None = None
         if self.asr is not None and callable(getattr(self.asr, "push_pcm", None)):
-            transcript = await self.asr.push_pcm(frame)
+            try:
+                transcript = await self.asr.push_pcm(frame)
+            except Exception as exc:
+                await self.handle_asr_failure(exc)
+                return
             if transcript is not None:
                 await self._publish({"event": "transcript", "payload": transcript.to_dict()})
                 self.fusion.accept_transcript(transcript)
                 await self._route_transcript_to_interpretation(transcript)
         if self.turn is None or not callable(getattr(self.turn, "push_pcm", None)):
             return
-        for candidate in await self.turn.push_pcm(frame):
+        try:
+            turn_candidates = await self.turn.push_pcm(frame)
+        except (asyncio.TimeoutError, TimeoutError):
+            await self._handle_turn_timeout(transcript, frame)
+            return
+        for candidate in turn_candidates:
             for fusion_event in self.fusion.accept_turn(candidate):
                 tentative = self.controller.handle_candidate(self.session_state, fusion_event)
                 if tentative:
@@ -494,7 +508,11 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
     ) -> TranscriptChunk | None:
         if self.asr is None or not callable(getattr(self.asr, "finalize_turn", None)):
             return transcript
-        final_chunk = await self.asr.finalize_turn()
+        try:
+            final_chunk = await self.asr.finalize_turn()
+        except Exception as exc:
+            await self.handle_asr_failure(exc)
+            return transcript
         if final_chunk.text or final_chunk.is_final:
             await self._publish({"event": "transcript", "payload": final_chunk.to_dict()})
             self.fusion.accept_transcript(final_chunk)
@@ -523,6 +541,9 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             candidate=candidate,
         )
         decision = await self.policy_engine.decide(request)
+        if "timeout" in decision.rationale.lower() and decision.action.value == "UNCERTAIN":
+            await self.handle_policy_timeout(decision.rationale)
+            return
         actions = self.controller.apply_policy(self.session_state, decision)
         if actions:
             await self.apply_controller_actions(actions)
@@ -619,16 +640,9 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                 if isinstance(item, ResponseStreamEnd):
                     return
                 self.record_response_segment(item)
-                request_id = self._tts_request_id(item)
-                stream = await self._start_tts_stream(item, request_id)
-                async for raw_chunk in _iterate_maybe_async(stream):
-                    if token.is_cancelled() or not self.generation_clock.is_current(epoch):
-                        break
-                    chunk = self._tag_audio(raw_chunk, item, request_id, self.playback.active_playback_attempt_id)
-                    self.record_audio_chunk(chunk)
-                    self.session_state.response = ResponseState.PLAYING
-                    self.session_state.floor = FloorState.ASSISTANT
-                    await self._publish_audio_chunk(chunk)
+                keep_running = await self._stream_tts_segment(item, epoch, token)
+                if not keep_running:
+                    return
             finally:
                 queue.task_done()
 
@@ -684,6 +698,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         await self._generation_slot.cancel()
         await self._interrupt_provider(self.llm)
         await self._interrupt_provider(self.tts)
+        self._playback_failed = False
 
     async def _publish_command(self, command: Any) -> None:
         normalized = _normalize_command_event(
@@ -704,7 +719,9 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             await self.close()
             raise self._terminal_error from exc
 
-    async def _publish_audio_chunk(self, chunk: AudioChunk) -> None:
+    async def _publish_audio_chunk(self, chunk: AudioChunk) -> bool:
+        if self._playback_failed:
+            return False
         await self._publish(
             {
                 "event": "audio_chunk",
@@ -719,6 +736,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                 },
             }
         )
+        return not self._playback_failed
 
     async def _route_transcript_to_interpretation(self, transcript: TranscriptChunk) -> None:
         if self.conversation_mode is not ConversationMode.INTERPRETATION:
@@ -735,9 +753,200 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             return ""
         return checkpoint.generated_text
 
+    def snapshot(self) -> dict[str, Any]:
+        current = self.checkpoints.get(self.current_response_id) if self.current_response_id else None
+        paused = [
+            self._checkpoint_snapshot(checkpoint)
+            for checkpoint in self.checkpoints.all()
+            if checkpoint.paused and checkpoint.resumable and not checkpoint.archived
+        ]
+        return {
+            "mode": self.conversation_mode.value,
+            "floor": self.session_state.floor.value,
+            "response": self.session_state.response.value,
+            "generation_epoch": self.generation_epoch,
+            "current_response_id": self.current_response_id,
+            "current_response": self._checkpoint_snapshot(current) if current is not None else None,
+            "paused_responses": paused,
+            "playback_cursor": self._playback_cursor(current),
+        }
+
     def _next_response_id(self) -> str:
         self._response_identifiers += 1
         return f"response-{self._response_identifiers}"
+
+    async def handle_policy_timeout(self, rationale: str = "policy timeout") -> None:
+        self.session_state.floor = FloorState.USER
+        self.session_state.response = ResponseState.PAUSED
+        await self._publish({"event": "policy_uncertain", "payload": {"message": rationale}})
+        await self._publish(
+            {
+                "event": "request_clarification",
+                "payload": {"message": "I need you to repeat or clarify that request."},
+            }
+        )
+
+    async def handle_asr_failure(self, error: BaseException) -> None:
+        self.session_state.floor = FloorState.USER
+        self.session_state.response = ResponseState.PAUSED
+        await self._publish(
+            {
+                "event": "request_repeat",
+                "payload": {"message": f"ASR failed, please repeat: {error}"},
+            }
+        )
+
+    async def handle_playback_failure(self, error: BaseException) -> None:
+        self._playback_failed = True
+        self.session_state.response = ResponseState.PAUSED
+        await self._publish(
+            {
+                "event": "playback_failed",
+                "payload": {"message": str(error)},
+            }
+        )
+
+    async def _handle_turn_timeout(
+        self,
+        transcript: TranscriptChunk | None,
+        frame: RealtimeAudioFrame,
+    ) -> None:
+        activity = self.ingress.last_activity_candidate
+        if activity is not None:
+            self.fusion.accept_activity(activity)
+        if transcript is None or not transcript.text.strip():
+            return
+        fallback = SpeechCandidateEvent(
+            event="USER_TURN_END_CANDIDATE",
+            event_id=f"turn-timeout-{frame.sequence}",
+            timestamp=frame.capture_timestamp,
+            source="turn_timeout_fallback",
+            payload={
+                "label": "turn_end",
+                "confidence": 0.0,
+                "evidence": {
+                    "activity_active": bool(activity.active) if activity is not None else None,
+                    "transcript": transcript.to_dict(),
+                },
+            },
+        )
+        await self._apply_policy(fallback, transcript)
+
+    async def _stream_tts_segment(
+        self,
+        segment: TextSegment,
+        epoch: int,
+        token: CancellationToken,
+    ) -> bool:
+        request_id = self._tts_request_id(segment)
+        published_any = False
+        while True:
+            try:
+                stream = await self._start_tts_stream(segment, request_id)
+                async for raw_chunk in _iterate_maybe_async(stream):
+                    if token.is_cancelled() or not self.generation_clock.is_current(epoch):
+                        return False
+                    chunk = self._tag_audio(
+                        raw_chunk,
+                        segment,
+                        request_id,
+                        self.playback.active_playback_attempt_id,
+                    )
+                    self.record_audio_chunk(chunk)
+                    self.session_state.response = ResponseState.PLAYING
+                    self.session_state.floor = FloorState.ASSISTANT
+                    published_any = True
+                    if not await self._publish_audio_chunk(chunk):
+                        return False
+                return True
+            except Exception as exc:
+                if published_any:
+                    terminal = await self._tts_supervisor.recover(exc)
+                else:
+                    terminal = await self._tts_supervisor.recover(
+                        exc,
+                        on_restart=self._restart_tts_worker,
+                    )
+                if terminal is True and not published_any:
+                    continue
+                await self._handle_terminal_tts_failure(segment, exc, terminal)
+                return False
+
+    async def _restart_tts_worker(self, _error: BaseException, _restart_count: int) -> None:
+        await self._close_tts_runtime()
+        await self._reset_provider(self.tts)
+
+    async def _handle_terminal_tts_failure(
+        self,
+        segment: TextSegment,
+        error: BaseException,
+        terminal: bool | WorkerTerminalEvent,
+    ) -> None:
+        self.session_state.response = ResponseState.PAUSED
+        await self._publish(
+            {
+                "event": "tts_failed",
+                "response_id": segment.response_id,
+                "generation_epoch": segment.generation_epoch,
+                "payload": {"message": str(error), "text": segment.text},
+            }
+        )
+        if isinstance(terminal, WorkerTerminalEvent):
+            event = terminal.to_dict()
+            event["response_id"] = segment.response_id
+            event["generation_epoch"] = segment.generation_epoch
+            await self._publish(event)
+
+    async def _close_tts_runtime(self) -> None:
+        for candidate in (
+            self.tts,
+            getattr(self.tts, "provider", None),
+            getattr(getattr(self.tts, "provider", None), "runtime", None),
+            getattr(self.tts, "runtime", None),
+        ):
+            close = getattr(candidate, "close", None) if candidate is not None else None
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+                return
+
+    @staticmethod
+    def _checkpoint_snapshot(checkpoint: Any) -> dict[str, Any]:
+        return {
+            "response_id": checkpoint.response_id,
+            "generation_epoch": checkpoint.generation_epoch,
+            "text": checkpoint.generated_text,
+            "generated_cursor": checkpoint.generated_cursor,
+            "committed_cursor": checkpoint.committed_cursor,
+            "synthesized_cursor": checkpoint.synthesized_cursor,
+            "played_cursor": checkpoint.played_cursor,
+            "paused": checkpoint.paused,
+        }
+
+    @staticmethod
+    def _playback_cursor(checkpoint: Any | None) -> dict[str, Any]:
+        if checkpoint is None:
+            return {
+                "response_id": None,
+                "segment_id": None,
+                "sample_offset": 0,
+                "played_cursor": 0,
+            }
+        pending_segment_id = None
+        pending_offset = 0
+        for segment_id in sorted(checkpoint.segments):
+            segment = checkpoint.segments[segment_id]
+            if segment.played_offset < segment.sample_count or (segment.sample_count == 0 and segment.text):
+                pending_segment_id = segment_id
+                pending_offset = segment.played_offset
+                break
+        return {
+            "response_id": checkpoint.response_id,
+            "segment_id": pending_segment_id,
+            "sample_offset": pending_offset,
+            "played_cursor": checkpoint.played_cursor,
+        }
 
     @staticmethod
     def _tts_request_id(segment: TextSegment) -> str:
@@ -919,6 +1128,7 @@ def build_production_runtime_factory(
     effective = _effective_model_config(model_config, overrides or {})
     loaders = dict(_default_runtime_loaders())
     loaders.update(runtime_loaders or {})
+    memory_manager = _build_model_manager(model_config)
     resolved_session_options = dict(session_options or {})
     if audio_config is not None:
         output_config = dict(audio_config.get("output", {}))
@@ -937,7 +1147,24 @@ def build_production_runtime_factory(
             profile = effective.get(name)
             if not profile:
                 continue
+            if memory_manager is not None:
+                requested_bytes = _profile_int(
+                    profile,
+                    "estimated_vram_bytes",
+                    default=0,
+                )
+                overhead_bytes = dict(profile.get("vram_overhead_bytes", {}))
+                if requested_bytes or overhead_bytes:
+                    memory_manager.reserve(
+                        name,
+                        requested_bytes=requested_bytes,
+                        overhead_bytes={key: int(value) for key, value in overhead_bytes.items()},
+                    )
             loaded = loaders[name](profile)
+            if memory_manager is not None:
+                used_bytes = _profile_int(profile, "loaded_vram_bytes", default=requested_bytes)
+                if requested_bytes or used_bytes:
+                    memory_manager.record_loaded(name, used_bytes=used_bytes)
             resources[name] = _SharedRuntimeBoundary(loaded)
         return resources
 
@@ -1119,3 +1346,31 @@ async def _close_runtime_resource(resource: Any) -> None:
             if inspect.isawaitable(result):
                 await result
             return
+
+
+def _build_model_manager(model_config: Mapping[str, Any]) -> ModelManager | None:
+    runtime = dict(model_config.get("runtime", {}))
+    budget = runtime.get("vram_budget_bytes")
+    reserve = runtime.get("vram_reserve_bytes", 0)
+    if budget is None:
+        return None
+    return ModelManager(
+        total_vram_bytes=int(budget),
+        reserve_bytes=int(reserve),
+        measure_allocated_bytes=_measure_cuda_allocated_bytes,
+    )
+
+
+def _measure_cuda_allocated_bytes() -> int:
+    try:
+        import torch
+    except ImportError:
+        return 0
+    if not torch.cuda.is_available():
+        return 0
+    return int(torch.cuda.memory_allocated())
+
+
+def _profile_int(profile: Mapping[str, Any], key: str, *, default: int = 0) -> int:
+    value = profile.get(key, default)
+    return int(value)

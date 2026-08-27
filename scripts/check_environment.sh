@@ -19,6 +19,7 @@ check_command() {
 echo "Environment check"
 check_command python3
 check_command git
+check_command node
 if mkdir -p "$MODEL_HOME" && [[ -w "$MODEL_HOME" ]]; then
   echo "OK: writable model directory ($MODEL_HOME)"
 else
@@ -35,6 +36,12 @@ if command -v modelscope >/dev/null 2>&1; then
   echo "OK: ModelScope download tool"
 else
   echo "MISSING: ModelScope download tool (modelscope)"
+  status=1
+fi
+if python3 "$REPOSITORY_ROOT/scripts/run_realtime_acceptance.py" --help >/dev/null 2>&1; then
+  echo "OK: realtime acceptance CLI"
+else
+  echo "MISSING: realtime acceptance CLI dependencies"
   status=1
 fi
 exit "$status"

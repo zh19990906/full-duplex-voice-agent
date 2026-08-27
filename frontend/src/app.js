@@ -85,6 +85,7 @@ export function bootResearchConsole(
       if (type === "token") assistantMessage.append(envelope.payload?.text || "");
       if (type === "transcript") appendChat(type, envelope.payload?.text || "");
       if (type === "translation") appendChat("assistant", envelope.payload?.translated_text || "");
+      if (type === "session_snapshot") byId("agent-state").textContent = JSON.stringify(envelope.payload, null, 2);
       if (type === "audio") playback.enqueue({
         response_id: eventField(envelope, "response_id"),
         generation_epoch: eventField(envelope, "generation_epoch", 0),
@@ -99,9 +100,16 @@ export function bootResearchConsole(
       if (type === "duck") playback.duck();
       if (type === "restore") playback.restore();
       if (type === "pause_response") playback.pauseResponse(eventField(envelope, "response_id"));
+      if (type === "policy_uncertain") setStatus(envelope.payload?.message || "policy uncertain");
+      if (type === "request_clarification" || type === "request_repeat") {
+        appendChat("assistant", envelope.payload?.message || "");
+      }
       if (type === "resume_response") playback.resumeResponse(envelope.payload ?? envelope);
       if (type === "stop_response") playback.stopResponse(eventField(envelope, "response_id"));
       if (type === "set_epoch") playback.setEpoch(eventField(envelope, "generation_epoch", 0));
+      if (type === "playback_failed" || type === "tts_failed" || type === "worker_terminal") {
+        setStatus(envelope.payload?.message || type);
+      }
       if (type === "agent_state") byId("agent-state").textContent = JSON.stringify(envelope.payload, null, 2);
       if (type === "tool_call" || type === "tool_result") byId("tool-output").textContent = JSON.stringify(envelope.payload, null, 2);
     }));

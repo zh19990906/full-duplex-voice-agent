@@ -3,15 +3,22 @@ export const EVENT_TYPES = Object.freeze([
   "translation",
   "token",
   "audio",
+  "session_snapshot",
   "tool_call",
   "tool_result",
   "agent_state",
   "duck",
   "restore",
   "pause_response",
+  "policy_uncertain",
+  "request_clarification",
+  "request_repeat",
   "resume_response",
   "stop_response",
   "set_epoch",
+  "playback_failed",
+  "tts_failed",
+  "worker_terminal",
 ]);
 
 const normalizeEventName = (name) => {

@@ -65,6 +65,9 @@ class ResponseCheckpointStore:
     def get(self, response_id: str) -> ResponseCheckpoint | None:
         return self._checkpoints.get(response_id)
 
+    def all(self) -> tuple[ResponseCheckpoint, ...]:
+        return tuple(self._checkpoints.values())
+
     def record_generated_text(self, response_id: str, text: str) -> None:
         checkpoint = self._require(response_id)
         checkpoint.generated_text += text
