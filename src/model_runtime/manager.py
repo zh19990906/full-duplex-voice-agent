@@ -102,9 +102,16 @@ class ModelManager:
             measured_bytes = None
             if after_bytes is not None and reservation.before_bytes is not None:
                 measured_bytes = max(0, after_bytes - reservation.before_bytes)
-            actual_bytes = measured_bytes if measured_bytes is not None else used_bytes
-            if actual_bytes is None:
+            conservative_bytes = used_bytes
+            if measured_bytes is not None and measured_bytes > 0:
+                conservative_bytes = measured_bytes
+            if conservative_bytes is None:
                 raise ValueError("used_bytes is required when CUDA measurement is unavailable")
+            committed_model_bytes = max(
+                reservation.requested_bytes,
+                conservative_bytes,
+            )
+            actual_bytes = committed_model_bytes + sum(reservation.overhead_bytes.values())
             previous_used = reservation.used_bytes or 0
             other_pending = sum(
                 item.planned_bytes

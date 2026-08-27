@@ -50,6 +50,11 @@ class _ExplodingLlm(_IdleLlm):
         raise RuntimeError("llm broke")
 
 
+class _SingleSegmentLlm(_IdleLlm):
+    async def stream_tokens(self, _prompt, **_options):
+        yield "preserve this."
+
+
 class _FinalFailingAsr:
     async def push_pcm(self, _frame):
         return TranscriptChunk("partial", "stable request", 1.0, False, revision_id=1)
@@ -285,6 +290,44 @@ class RealtimeDegradationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(await task)
         self.assertEqual(replacement.requests, [])
+        await runtime.close()
+
+    async def test_tts_reload_failure_stays_terminal_tts_path_with_checkpoint(self):
+        """Catches worker recreation failure bubbling out as an LLM failure."""
+        failed = _FailingTts()
+
+        async def fail_recovery():
+            raise RuntimeError("tts reload failed")
+
+        runtime = ServerRealtimeSessionRuntime(
+            "session-tts-reload-failure",
+            llm=_SingleSegmentLlm(),
+            tts=failed,
+            tts_recovery=fail_recovery,
+        )
+
+        await runtime._run_generation("hello")
+        events = []
+        while not runtime._events.empty():
+            events.append(runtime._events.get_nowait())
+        named = [event for event in events if isinstance(event, dict)]
+        names = [event.get("event") for event in named]
+        failures = [
+            event for event in named if event.get("event") in {"tts_failed", "worker_terminal"}
+        ]
+        checkpoint = runtime.checkpoints.get(runtime.current_response_id)
+
+        self.assertIn("tts_failed", names)
+        self.assertIn("worker_terminal", names)
+        self.assertNotIn("llm_failed", names)
+        self.assertNotIn("response_completed", names)
+        self.assertTrue(checkpoint.paused)
+        self.assertEqual(checkpoint.segments[0].text, "preserve this.")
+        for failure in failures:
+            self.assertEqual(failure["response_id"], runtime.current_response_id)
+            self.assertEqual(failure["generation_epoch"], runtime.generation_epoch)
+            self.assertEqual(failure["payload"]["response_id"], runtime.current_response_id)
+            self.assertEqual(failure["payload"]["generation_epoch"], runtime.generation_epoch)
         await runtime.close()
 
 

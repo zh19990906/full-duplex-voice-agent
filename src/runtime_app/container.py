@@ -610,7 +610,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             result = await pipeline.run(self.prompt_builder(text))
             self._assistant_last_text = result.text
             await consumer
-            if not result.stale and not result.cancelled:
+            if not result.stale and not result.cancelled and not token.is_cancelled():
                 await self._publish(
                     {
                         "event": "response_completed",
@@ -907,13 +907,28 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                         return False
                 return True
             except Exception as exc:
-                if published_any:
-                    terminal = await self._tts_supervisor.recover(exc)
-                else:
-                    terminal = await self._tts_supervisor.recover(
-                        exc,
-                        on_restart=self._restart_tts_worker,
+                try:
+                    if published_any:
+                        terminal = await self._tts_supervisor.recover(exc)
+                    else:
+                        terminal = await self._tts_supervisor.recover(
+                            exc,
+                            on_restart=self._restart_tts_worker,
+                        )
+                except Exception as recovery_error:
+                    terminal = WorkerTerminalEvent(
+                        worker="tts",
+                        message=str(recovery_error),
+                        restart_count=self._tts_supervisor.restart_count,
+                        error_type=type(recovery_error).__name__,
                     )
+                    await self._handle_terminal_tts_failure(
+                        segment,
+                        recovery_error,
+                        terminal,
+                    )
+                    token.cancel()
+                    return False
                 if terminal is True and not published_any:
                     if token.is_cancelled() or not self.generation_clock.is_current(epoch):
                         return False
@@ -925,6 +940,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                     request_id = self._tts_request_id(active_segment)
                     continue
                 await self._handle_terminal_tts_failure(segment, exc, terminal)
+                token.cancel()
                 return False
 
     async def _restart_tts_worker(self, _error: BaseException, _restart_count: int) -> None:
@@ -959,19 +975,31 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         error: BaseException,
         terminal: bool | WorkerTerminalEvent,
     ) -> None:
+        response_id = segment.response_id
+        generation_epoch = segment.generation_epoch
+        if response_id is not None and self.checkpoints.get(response_id) is not None:
+            self.checkpoints.pause(response_id)
+        self.session_state.floor = FloorState.USER
         self.session_state.response = ResponseState.PAUSED
         await self._publish(
             {
                 "event": "tts_failed",
-                "response_id": segment.response_id,
-                "generation_epoch": segment.generation_epoch,
-                "payload": {"message": str(error), "text": segment.text},
+                "response_id": response_id,
+                "generation_epoch": generation_epoch,
+                "payload": {
+                    "message": str(error),
+                    "text": segment.text,
+                    "response_id": response_id,
+                    "generation_epoch": generation_epoch,
+                },
             }
         )
         if isinstance(terminal, WorkerTerminalEvent):
             event = terminal.to_dict()
-            event["response_id"] = segment.response_id
-            event["generation_epoch"] = segment.generation_epoch
+            event["response_id"] = response_id
+            event["generation_epoch"] = generation_epoch
+            event["payload"]["response_id"] = response_id
+            event["payload"]["generation_epoch"] = generation_epoch
             await self._publish(event)
 
     async def _close_tts_runtime(self) -> None:
@@ -1197,10 +1225,25 @@ class ProductionRealtimeRuntimeFactory:
         if resources is None:
             return
         self._resources = None
+        errors: list[BaseException] = []
         for name, resource in resources.items():
-            await _close_runtime_resource(resource)
-            if self._memory_manager is not None:
-                self._memory_manager.release(name)
+            try:
+                await _close_runtime_resource(resource)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if self._memory_manager is not None:
+                    try:
+                        self._memory_manager.release(name)
+                    except BaseException as exc:
+                        errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            details = "; ".join(
+                f"{type(error).__name__}: {error}" for error in errors
+            )
+            raise RuntimeError(f"factory close failed: {details}") from errors[0]
 
 
 def build_production_runtime_factory(
@@ -1538,7 +1581,8 @@ def _measure_cuda_allocated_bytes(device: str | None = None) -> int:
         return 0
     if not torch.cuda.is_available():
         return 0
-    return int(torch.cuda.memory_allocated(device))
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return int(total_bytes - free_bytes)
 
 
 def _profile_int(profile: Mapping[str, Any], key: str, *, default: int = 0) -> int:

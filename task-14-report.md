@@ -15,11 +15,14 @@
 - Bounded worker supervision now performs at most one restart after backoff, propagates cancellation, and closes idempotently.
 - Final-ASR failure aborts policy/generation; X2 timeout fallback requires silent activity plus stable/final ASR evidence.
 - LLM failure pauses and preserves the response checkpoint and publishes identity-bearing `llm_failed`.
-- Production TTS recovery closes and replaces the shared worker, then resubmits checkpoint-derived unsynthesized text once with epoch/cancellation fencing.
-- VRAM admission uses an explicit budget or CUDA device capacity, atomically accounts pending and loaded reservations, records measured CUDA deltas, closes over-budget partial loads, and releases accounting on failure or factory close.
+- Production TTS recovery closes and replaces the shared worker, then resubmits checkpoint-derived unsynthesized text once with epoch/cancellation fencing. Reload failure remains terminal TTS state, preserves and pauses the checkpoint, and publishes identity-bearing `tts_failed` and `worker_terminal` events without falling through to `llm_failed`.
+- VRAM admission uses an explicit budget or CUDA device capacity and atomically accounts pending and loaded reservations. Committed loaded capacity retains `max(device-wide measured or conservative model bytes, requested bytes) + runtime overhead`; zero/unobservable deltas cannot erase a nonzero estimate.
+- Factory shutdown attempts every resource close and releases each reservation in a per-resource `finally`, raising collected cleanup errors only after all resources have been attempted.
 - The frontend event allowlist and status handling now include `llm_failed`.
 
 Focused verification for this slice is recorded in the commit report; hardware/model-integration gates remain external.
+
+Round-two runtime verification: `python3 -m unittest tests.test_model_memory_budget tests.test_runtime_app_container tests.test_realtime_degradation -v` — PASS (`39` tests).
 
 ## Verification
 

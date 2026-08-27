@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from src.runtime_app.container import (
     _default_runtime_loaders,
     _effective_model_config,
     _load_x2_runtime_from_profile,
+    _measure_cuda_allocated_bytes,
     ServerRealtimeSessionRuntime,
     SlowConsumerError,
     build_production_runtime_factory,
@@ -127,6 +129,18 @@ class _ClosableLoadedRuntime:
 
     def close(self):
         self.closed = True
+
+
+class _CloseRecordingRuntime:
+    def __init__(self, name, closed, *, error=None):
+        self.name = name
+        self.closed = closed
+        self.error = error
+
+    async def close(self):
+        self.closed.append(self.name)
+        if self.error is not None:
+            raise self.error
 
 
 class _FakeStreamingAsr:
@@ -662,6 +676,20 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(explicit.total_vram_bytes, 900)
         self.assertEqual(explicit.reserve_bytes, 100)
 
+    def test_cuda_measurement_uses_device_wide_free_memory_delta_source(self):
+        """Catches reverting to parent-process allocation for subprocess-backed models."""
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                mem_get_info=lambda device: (30, 100),
+            )
+        )
+
+        with patch.dict("sys.modules", {"torch": fake_torch}):
+            used_bytes = _measure_cuda_allocated_bytes("cuda:1")
+
+        self.assertEqual(used_bytes, 70)
+
     async def test_measured_overage_closes_partial_resource_and_releases_budget(self):
         """Catches a measured-over-budget model remaining live or reserved after rejection."""
         loaded = _ClosableLoadedRuntime()
@@ -725,3 +753,34 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item[0] for item in replacement.requests], ["checkpoint replay"])
         await runtime.close()
         await factory.close()
+
+    async def test_factory_close_attempts_all_resources_and_releases_all_reservations(self):
+        """Catches one close failure preventing later cleanup and accounting release."""
+        closed = []
+        runtimes = {
+            name: _CloseRecordingRuntime(
+                name,
+                closed,
+                error=RuntimeError("asr close failed") if name == "asr" else None,
+            )
+            for name in MODEL_CONFIG["models"]
+        }
+        factory = build_production_runtime_factory(
+            model_config={
+                "models": MODEL_CONFIG["models"],
+                "runtime": {"vram_budget_bytes": 1000},
+            },
+            runtime_loaders={
+                name: (lambda _profile, runtime=runtime: runtime)
+                for name, runtime in runtimes.items()
+            },
+        )
+        factory("session-close-all")
+
+        with self.assertRaisesRegex(RuntimeError, "asr close failed"):
+            await factory.close()
+
+        self.assertEqual(set(closed), set(MODEL_CONFIG["models"]))
+        self.assertEqual(factory.memory_diagnostics["models"], {})
+        self.assertEqual(factory.memory_diagnostics["loaded_bytes"], 0)
+        self.assertEqual(factory.memory_diagnostics["reserved_bytes"], 0)

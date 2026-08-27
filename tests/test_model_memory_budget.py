@@ -84,6 +84,44 @@ class ModelMemoryBudgetTests(unittest.TestCase):
         self.assertEqual(manager.diagnostics()["loaded_bytes"], 35)
         self.assertEqual(manager.diagnostics()["reserved_bytes"], 0)
 
+    def test_loaded_capacity_retains_requested_floor_and_runtime_overhead(self):
+        """Catches a successful load dropping its conservative floor or runtime overhead."""
+        snapshots = iter((10, 22, 22))
+        manager = ModelManager(
+            total_vram_bytes=100,
+            measure_allocated_bytes=lambda: next(snapshots),
+        )
+        manager.reserve(
+            "qwen",
+            requested_bytes=20,
+            overhead_bytes={"kv_cache": 7, "cuda_context": 3},
+        )
+
+        record = manager.record_loaded("qwen", used_bytes=18)
+
+        self.assertEqual(record["used_bytes"], 30)
+        self.assertEqual(manager.diagnostics()["loaded_bytes"], 30)
+        with self.assertRaises(ModelMemoryBudgetError):
+            manager.reserve("cosyvoice", requested_bytes=71)
+
+    def test_zero_measurement_never_replaces_nonzero_conservative_estimate(self):
+        """Catches an unobservable subprocess load being accounted as zero bytes."""
+        snapshots = iter((40, 40))
+        manager = ModelManager(
+            total_vram_bytes=100,
+            measure_allocated_bytes=lambda: next(snapshots),
+        )
+        manager.reserve(
+            "cosyvoice",
+            requested_bytes=20,
+            overhead_bytes={"worker_runtime": 5},
+        )
+
+        record = manager.record_loaded("cosyvoice", used_bytes=24)
+
+        self.assertEqual(record["used_bytes"], 29)
+        self.assertEqual(manager.diagnostics()["loaded_bytes"], 29)
+
     def test_measured_overage_is_rejected_after_load(self):
         """Catches a model whose real CUDA delta exceeds the safe budget."""
         snapshots = iter((10, 95))
