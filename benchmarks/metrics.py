@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Mapping
 
 from .timeline import BenchmarkTimeline
@@ -12,7 +13,7 @@ METRIC_EVENTS: Mapping[str, tuple[str, str]] = {
     "first_transcript_latency_ms": ("audio_received", "first_asr_partial"),
     "duck_latency_ms": ("user_speech_start", "assistant_ducked"),
     "first_token_latency_ms": ("turn_end", "first_llm_token"),
-    "first_audio_latency_ms": ("first_llm_token", "first_audio_chunk"),
+    "first_audio_latency_ms": ("turn_end", "first_audio_chunk"),
     "interrupt_latency_ms": ("user_interrupt", "tts_stopped"),
     "cancellation_latency_ms": ("cancel_requested", "generation_cancelled"),
     "cancel_latency_ms": ("cancel_requested", "generation_cancelled"),
@@ -42,6 +43,44 @@ ACCEPTANCE_THRESHOLDS: Mapping[str, float] = {
     "stale_output_count": 0.0,
     "resume_phrase_error_count": 1.0,
 }
+
+
+class EvidenceSource(str, Enum):
+    """Capture paths that may produce high-tier acceptance evidence."""
+
+    RECORDED_AUDIO_REALTIME = "recorded-audio-realtime"
+    BROWSER_HEADSET = "browser-headset"
+
+
+@dataclass(frozen=True)
+class AcceptanceProvenance:
+    """Runner-issued identity for one in-process acceptance capture."""
+
+    source: EvidenceSource
+    run_id: str
+    producer: str
+
+    RUNNER_PRODUCER = "realtime-acceptance-runner"
+
+    @classmethod
+    def runner_capture(
+        cls,
+        source: EvidenceSource,
+        *,
+        run_id: str,
+    ) -> "AcceptanceProvenance":
+        if not isinstance(source, EvidenceSource):
+            raise TypeError("source must be an EvidenceSource")
+        if not run_id.strip():
+            raise ValueError("run_id must not be empty")
+        return cls(source=source, run_id=run_id, producer=cls.RUNNER_PRODUCER)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "source": self.source.value,
+            "run_id": self.run_id,
+            "producer": self.producer,
+        }
 
 
 @dataclass(frozen=True)
@@ -80,8 +119,7 @@ def evaluate_acceptance(
     metrics: Mapping[str, float],
     *,
     label: str,
-    explicit_real_run: bool = True,
-    required_measurements_present: bool = True,
+    provenance: AcceptanceProvenance | None = None,
 ) -> AcceptanceResult:
     """Evaluate V1 hard gates for an explicitly labeled evidence tier."""
 
@@ -100,11 +138,16 @@ def evaluate_acceptance(
             continue
         if value > limit:
             failures.append(metric_name)
-    if label == "hardware-e2e":
-        if not explicit_real_run:
-            failures.append("hardware_e2e_requires_explicit_real_run")
-        if not required_measurements_present:
-            failures.append("hardware_e2e_missing_required_measurements")
+    runner_source = (
+        provenance.source
+        if provenance is not None
+        and provenance.producer == AcceptanceProvenance.RUNNER_PRODUCER
+        else None
+    )
+    if label == "model-integration" and runner_source is not EvidenceSource.RECORDED_AUDIO_REALTIME:
+        failures.append("model_integration_requires_recorded_audio_runner")
+    if label == "hardware-e2e" and runner_source is not EvidenceSource.BROWSER_HEADSET:
+        failures.append("hardware_e2e_requires_browser_headset_runner")
     return AcceptanceResult(
         label=label,
         passed=not failures,

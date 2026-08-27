@@ -1,6 +1,18 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from benchmarks.metrics import evaluate_acceptance
+from benchmarks.metrics import (
+    AcceptanceProvenance,
+    EvidenceSource,
+    evaluate_acceptance,
+)
+from benchmarks.real_hardware_runner import AcceptanceEvidence
+from benchmarks.timeline import BenchmarkTimeline
+from benchmarks.metrics import calculate_metrics
+from scripts import run_realtime_acceptance
 
 
 _PASSING_METRICS = {
@@ -31,25 +43,187 @@ class RealtimeAcceptanceTests(unittest.TestCase):
         self.assertEqual(result.label, "simulated")
         self.assertEqual(set(result.failures), {"interrupt_latency_ms", "stale_output_count"})
 
-    def test_hardware_e2e_requires_explicit_real_run_and_required_measurements(self):
-        """Catches synthetic or partial evidence being mislabeled as hardware E2E."""
-        not_real = evaluate_acceptance(
+    def test_high_tier_evidence_requires_matching_runner_provenance(self):
+        """Catches imported metrics or the wrong driver being promoted to a real tier."""
+        imported_model = evaluate_acceptance(
             _PASSING_METRICS,
-            label="hardware-e2e",
-            explicit_real_run=False,
-            required_measurements_present=True,
+            label="model-integration",
         )
-        missing_measurements = evaluate_acceptance(
+        recorded = AcceptanceProvenance.runner_capture(
+            EvidenceSource.RECORDED_AUDIO_REALTIME,
+            run_id="recorded-run-1",
+        )
+        wrong_driver = evaluate_acceptance(
             _PASSING_METRICS,
             label="hardware-e2e",
-            explicit_real_run=True,
-            required_measurements_present=False,
+            provenance=recorded,
         )
 
-        self.assertFalse(not_real.passed)
-        self.assertFalse(missing_measurements.passed)
-        self.assertIn("hardware_e2e_requires_explicit_real_run", not_real.failures)
-        self.assertIn("hardware_e2e_missing_required_measurements", missing_measurements.failures)
+        self.assertFalse(imported_model.passed)
+        self.assertFalse(wrong_driver.passed)
+        self.assertIn("model_integration_requires_recorded_audio_runner", imported_model.failures)
+        self.assertIn("hardware_e2e_requires_browser_headset_runner", wrong_driver.failures)
+
+    def test_matching_runner_provenance_allows_real_tiers_to_be_evaluated(self):
+        """Catches provenance checks that reject captures from the required driver."""
+        model = evaluate_acceptance(
+            _PASSING_METRICS,
+            label="model-integration",
+            provenance=AcceptanceProvenance.runner_capture(
+                EvidenceSource.RECORDED_AUDIO_REALTIME,
+                run_id="recorded-run-2",
+            ),
+        )
+        hardware = evaluate_acceptance(
+            _PASSING_METRICS,
+            label="hardware-e2e",
+            provenance=AcceptanceProvenance.runner_capture(
+                EvidenceSource.BROWSER_HEADSET,
+                run_id="hardware-run-1",
+            ),
+        )
+
+        self.assertTrue(model.passed)
+        self.assertTrue(hardware.passed)
+
+    def test_first_audio_latency_starts_at_confirmed_turn_end(self):
+        """Catches TTS-only latency that omits policy and LLM time before the first token."""
+        timeline = BenchmarkTimeline()
+        timeline.record("turn_end", 10.0)
+        timeline.record("first_llm_token", 10.6)
+        timeline.record("first_audio_chunk", 11.4)
+
+        metrics = calculate_metrics(timeline)
+
+        self.assertEqual(metrics["first_token_latency_ms"], 600.0)
+        self.assertEqual(metrics["first_audio_latency_ms"], 1400.0)
+
+    def test_missing_hard_gate_metrics_are_failures(self):
+        """Catches partial reports that pass by omitting measurements."""
+        result = evaluate_acceptance(
+            {"stale_output_count": 0.0},
+            label="simulated",
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIn("first_audio_latency_ms", result.failures)
+        self.assertIn("resume_phrase_error_count", result.failures)
+
+    def test_atomic_report_failure_preserves_previous_report(self):
+        """Catches interrupted report replacement that truncates valid evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "acceptance.json"
+            report.write_text("previous\n", encoding="utf-8")
+
+            with patch.object(
+                run_realtime_acceptance.os,
+                "replace",
+                side_effect=OSError("replacement interrupted"),
+            ):
+                with self.assertRaisesRegex(OSError, "replacement interrupted"):
+                    run_realtime_acceptance.write_report_atomic(report, "replacement\n")
+
+            self.assertEqual(report.read_text(encoding="utf-8"), "previous\n")
+            self.assertEqual([path.name for path in Path(directory).iterdir()], [report.name])
+
+
+class RealtimeAcceptanceCliTests(unittest.IsolatedAsyncioTestCase):
+    async def test_imported_json_is_limited_to_unit_and_simulated_labels(self):
+        """Catches imported JSON self-attesting as model or hardware evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / "metrics.json"
+            metrics_path.write_text(
+                json.dumps(
+                    {
+                        "metrics": _PASSING_METRICS,
+                        "provenance": {
+                            "source": EvidenceSource.BROWSER_HEADSET.value,
+                            "producer": AcceptanceProvenance.RUNNER_PRODUCER,
+                            "run_id": "forged-import",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = run_realtime_acceptance.parse_args(
+                ["--label", "model-integration", "--metrics-json", str(metrics_path)]
+            )
+
+            with self.assertRaisesRegex(ValueError, "only unit or simulated"):
+                await run_realtime_acceptance.run_acceptance(args)
+
+    async def test_simulated_label_evaluates_imported_metrics_without_provenance(self):
+        """Catches low-tier imported evaluation accidentally receiving runner provenance."""
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / "metrics.json"
+            metrics_path.write_text(json.dumps(_PASSING_METRICS), encoding="utf-8")
+            args = run_realtime_acceptance.parse_args(
+                ["--label", "simulated", "--metrics-json", str(metrics_path)]
+            )
+
+            payload = await run_realtime_acceptance.run_acceptance(args)
+
+        self.assertTrue(payload["passed"])
+        self.assertIsNone(payload["provenance"])
+
+    async def test_model_integration_audio_is_run_through_recorded_audio_driver(self):
+        """Catches --audio being reported without executing the realtime capture driver."""
+        calls = []
+        timeline = BenchmarkTimeline()
+        driver = _StaticAcceptanceDriver(
+            AcceptanceEvidence(
+                metrics=dict(_PASSING_METRICS),
+                environment={"runtime": "task13"},
+                provenance=AcceptanceProvenance.runner_capture(
+                    EvidenceSource.RECORDED_AUDIO_REALTIME,
+                    run_id="recorded-test",
+                ),
+                timeline=timeline,
+            ),
+            calls,
+        )
+        args = run_realtime_acceptance.parse_args(
+            [
+                "--label",
+                "model-integration",
+                "--profile",
+                "local_gpu",
+                "--audio",
+                "/captures/turn.wav",
+            ]
+        )
+
+        payload = await run_realtime_acceptance.run_acceptance(
+            args,
+            recorded_audio_driver=driver,
+        )
+
+        self.assertTrue(payload["passed"])
+        self.assertEqual(calls, [("recorded", Path("/captures/turn.wav"), "local_gpu")])
+        self.assertEqual(
+            payload["provenance"]["source"],
+            EvidenceSource.RECORDED_AUDIO_REALTIME.value,
+        )
+
+    async def test_hardware_e2e_requires_browser_headset_driver(self):
+        """Catches command-line flags substituting for a physical capture driver."""
+        args = run_realtime_acceptance.parse_args(["--label", "hardware-e2e"])
+
+        with self.assertRaisesRegex(ValueError, "browser/headset capture driver"):
+            await run_realtime_acceptance.run_acceptance(args)
+
+
+class _StaticAcceptanceDriver:
+    def __init__(self, evidence, calls):
+        self.evidence = evidence
+        self.calls = calls
+
+    async def run(self, audio_path=None, *, profile):
+        if audio_path is None:
+            self.calls.append(("browser", profile))
+        else:
+            self.calls.append(("recorded", Path(audio_path), profile))
+        return self.evidence
 
 
 if __name__ == "__main__":

@@ -196,12 +196,13 @@ class TTSProviderTests(unittest.IsolatedAsyncioTestCase):
 
     def test_benchmark_ttfa_and_interrupt_latency(self):
         timeline = BenchmarkTimeline()
+        timeline.record("turn_end", 0.8)
         timeline.record("first_llm_token", 1.0)
         timeline.record("first_audio_chunk", 1.2)
         timeline.record("user_interrupt", 2.0)
         timeline.record("tts_stopped", 2.08)
         metrics = calculate_metrics(timeline)
-        self.assertEqual(metrics["first_audio_latency_ms"], 200.0)
+        self.assertEqual(metrics["first_audio_latency_ms"], 400.0)
         self.assertEqual(metrics["interrupt_latency_ms"], 80.0)
 
     @staticmethod

@@ -2,14 +2,20 @@ import asyncio
 import json
 import tempfile
 import unittest
+import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 from benchmarks.real_hardware_runner import (
+    BrowserHeadsetAcceptanceDriver,
     HardwareValidationError,
     HardwareValidationResult,
+    RecordedAudioRealtimeDriver,
     RealHardwareBenchmarkRunner,
     validate_hardware,
 )
+from benchmarks.metrics import EvidenceSource
+from src.realtime.audio_ingress import RealtimeAudioFrame
 from benchmarks.report import HardwareBenchmarkReport
 
 
@@ -67,6 +73,75 @@ class FakeRuntime:
     async def shutdown(self):
         self.shutdown_called = True
         self.initialized = False
+
+
+class RecordingRealtimeRuntime:
+    def __init__(self):
+        self.frames = []
+        self.started = False
+        self.closed = False
+
+    async def start(self):
+        self.started = True
+
+    async def accept_audio_frame(self, frame):
+        self.frames.append(frame)
+
+    async def flush(self):
+        return None
+
+    async def close(self):
+        self.closed = True
+
+    async def events(self):
+        yield {"event": "turn_end", "server_timestamp": 1.0, "payload": {}}
+        yield {"event": "token", "server_timestamp": 1.2, "payload": {}}
+        yield {"event": "audio_chunk", "server_timestamp": 1.5, "payload": {}}
+
+
+class RecordingRuntimeFactory:
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.closed = False
+
+    def __call__(self, _session_id):
+        return self.runtime
+
+    async def close(self):
+        self.closed = True
+
+
+class MutableClock:
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
+class TurnBoundaryController:
+    def handle_candidate(self, _state, _candidate):
+        return ()
+
+
+class ConfirmedTurnRuntime(RecordingRealtimeRuntime):
+    def __init__(self, clock):
+        super().__init__()
+        self.clock = clock
+        self.controller = TurnBoundaryController()
+
+    async def accept_audio_frame(self, frame):
+        self.frames.append(frame)
+        self.clock.value = 1.0
+        self.controller.handle_candidate(
+            None,
+            SimpleNamespace(event="USER_TURN_END_CANDIDATE"),
+        )
+        self.clock.value = 1.8
+
+    async def events(self):
+        yield {"event": "token", "server_timestamp": 1.2, "payload": {}}
+        yield {"event": "audio_chunk", "server_timestamp": 2.0, "payload": {}}
 
 
 class RealHardwareBenchmarkTests(unittest.IsolatedAsyncioTestCase):
@@ -140,6 +215,81 @@ class RealHardwareBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["environment"]["gpu"], "Test GPU")
         self.assertIn("Real Hardware Benchmark Report", report.to_text())
         self.assertIn("LLM TTFT: 200.00 ms", report.to_text())
+
+    async def test_recorded_audio_driver_feeds_task13_runtime_in_realtime_frames(self):
+        """Catches --audio being retained as metadata instead of entering the realtime runtime."""
+        runtime = RecordingRealtimeRuntime()
+        factory = RecordingRuntimeFactory(runtime)
+        sleep_delays = []
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "turn.wav"
+            with wave.open(str(audio_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16000)
+                output.writeframes(b"\x00\x00" * 640)
+            driver = RecordedAudioRealtimeDriver(
+                runtime_factory=lambda _profile: factory,
+                sleep=lambda delay: sleep_delays.append(delay),
+                drain_timeout=0.01,
+            )
+
+            evidence = await driver.run(audio_path, profile="local_gpu")
+
+        self.assertTrue(runtime.started)
+        self.assertTrue(runtime.closed)
+        self.assertTrue(factory.closed)
+        self.assertEqual([frame.header.sequence for frame in runtime.frames], [0, 1])
+        self.assertTrue(all(isinstance(frame, RealtimeAudioFrame) for frame in runtime.frames))
+        self.assertEqual(sleep_delays, [0.02])
+        self.assertEqual(evidence.provenance.source, EvidenceSource.RECORDED_AUDIO_REALTIME)
+        self.assertEqual(evidence.metrics["first_audio_latency_ms"], 500.0)
+
+    async def test_recorded_audio_driver_observes_confirmed_task13_turn_end(self):
+        """Catches EOF timing replacing the fused Task13 turn-end boundary."""
+        clock = MutableClock()
+        runtime = ConfirmedTurnRuntime(clock)
+        factory = RecordingRuntimeFactory(runtime)
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "turn.wav"
+            with wave.open(str(audio_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16000)
+                output.writeframes(b"\x00\x00" * 320)
+            driver = RecordedAudioRealtimeDriver(
+                runtime_factory=lambda _profile: factory,
+                sleep=lambda _delay: None,
+                drain_timeout=0.01,
+                clock=clock,
+            )
+
+            evidence = await driver.run(audio_path, profile="local_gpu")
+
+        self.assertEqual(evidence.timeline.first("turn_end").timestamp, 1.0)
+        self.assertEqual(evidence.metrics["first_audio_latency_ms"], 1000.0)
+
+    async def test_browser_headset_driver_executes_driver_and_stamps_runner_provenance(self):
+        """Catches hardware E2E reports produced without running the browser/headset driver."""
+        calls = []
+
+        async def run_browser(profile):
+            calls.append(profile)
+            return {
+                "timeline": [
+                    {"name": "turn_end", "timestamp": 2.0},
+                    {"name": "first_audio_chunk", "timestamp": 2.4},
+                ],
+                "metrics": {"resume_phrase_error_count": 0.0},
+                "environment": {"headset": "usb"},
+            }
+
+        evidence = await BrowserHeadsetAcceptanceDriver(run_browser).run(profile="local_gpu")
+
+        self.assertEqual(calls, ["local_gpu"])
+        self.assertEqual(evidence.provenance.source, EvidenceSource.BROWSER_HEADSET)
+        self.assertEqual(evidence.metrics["first_audio_latency_ms"], 400.0)
+        self.assertEqual(evidence.environment["headset"], "usb")
 
 
 if __name__ == "__main__":

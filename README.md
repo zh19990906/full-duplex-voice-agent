@@ -87,15 +87,25 @@ inference rather than streaming raw browser audio.
 
 ## Realtime acceptance
 
-Use the acceptance CLI to evaluate a report with an explicit evidence label:
+Use the acceptance CLI to run or evaluate evidence with an explicit label:
 
 ```bash
 python3 scripts/run_realtime_acceptance.py --help
 ```
 
 Accepted labels are `unit`, `simulated`, `model-integration`, and
-`hardware-e2e`. The CLI refuses to pass a `hardware-e2e` report unless it is
-explicitly marked as a real run and all required measurements are present.
+`hardware-e2e`. Imported JSON is accepted only for `unit` and `simulated`;
+provenance fields inside imported files are ignored and cannot promote them to
+a real-evidence tier. Every required hard-gate metric must be present.
+
+Evaluate imported simulated metrics:
+
+```bash
+python3 scripts/run_realtime_acceptance.py \
+  --label simulated \
+  --metrics-json /tmp/realtime-simulated-metrics.json \
+  --report /tmp/realtime-simulated-acceptance.json
+```
 
 Recorded-audio model integration on the GPU server:
 
@@ -107,15 +117,27 @@ python3 scripts/run_realtime_acceptance.py \
   --report /tmp/realtime-model-integration.json
 ```
 
+`--audio` is executable evidence, not report metadata. The runner decodes a
+PCM16 mono 16 kHz WAV into paced 20 ms frames, creates the same Task 13
+production realtime session used by the server, and derives metrics from its
+captured event timeline. The runner stamps `recorded-audio-realtime`
+provenance; an imported JSON file cannot self-attest this tier.
+
 Real browser/headset acceptance on the target machine:
 
 ```bash
 python3 scripts/run_realtime_acceptance.py \
   --profile local_gpu \
   --label hardware-e2e \
-  --explicit-real-run \
+  --browser-headset-driver /opt/voice-agent/bin/capture-browser-headset \
   --report /tmp/realtime-hardware-e2e.json
 ```
+
+The browser/headset executable is run by the acceptance runner with
+`--profile <profile>` and must print a JSON object containing its captured
+`timeline`, any non-latency `metrics`, and `environment`. Only successful
+execution of that driver receives `browser-headset` provenance; a boolean flag
+or previously saved JSON is insufficient.
 
 Required V1 hard gates:
 
@@ -123,14 +145,16 @@ Required V1 hard gates:
 - `interrupt_latency_ms <= 250`
 - `backchannel_restore_latency_ms <= 300`
 - `first_token_latency_ms <= 800`
-- `first_audio_latency_ms <= 1500`
+- `first_audio_latency_ms <= 1500`, measured from confirmed `turn_end` to the
+  first playable `audio_chunk`
 - `first_translated_audio_latency_ms <= 2000`
 - `stale_output_count == 0`
 - `resume_phrase_error_count <= 1`
 
 GPU, headset, and 60-minute soak validation are external gates. Run them on the
 target deployment and record them separately; do not relabel synthetic or
-partial evidence as `hardware-e2e`.
+partial evidence as `hardware-e2e`. Report files are replaced atomically only
+after the complete JSON has been written.
 
 ## High Level Architecture
 

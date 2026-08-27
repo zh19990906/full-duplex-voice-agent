@@ -34,7 +34,7 @@ class BenchmarkValidationTests(unittest.TestCase):
         metrics = calculate_metrics(timeline)
         self.assertEqual(metrics["first_transcript_latency_ms"], 120.0)
         self.assertEqual(metrics["first_token_latency_ms"], 150.0)
-        self.assertEqual(metrics["first_audio_latency_ms"], 250.0)
+        self.assertEqual(metrics["first_audio_latency_ms"], 400.0)
         self.assertEqual(metrics["interrupt_latency_ms"], 80.0)
         self.assertEqual(metrics["cancellation_latency_ms"], 50.0)
 

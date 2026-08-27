@@ -40,16 +40,16 @@ Use `--json` for machine-readable output:
 python3 -m benchmarks.real_hardware_runner --json
 ```
 
-Evaluate a benchmark or recorded run against the Task 14 hard gates with an
-explicit evidence label:
+Run or evaluate evidence against the Task 14 hard gates with an explicit label:
 
 ```bash
 python3 scripts/run_realtime_acceptance.py --help
 ```
 
 Valid labels are `unit`, `simulated`, `model-integration`, and
-`hardware-e2e`. Only an explicit real browser/headset run with the required
-measurements may pass as `hardware-e2e`.
+`hardware-e2e`. Imported metrics JSON is evaluable only as `unit` or
+`simulated`; embedded provenance is ignored. Missing hard-gate metrics always
+fail instead of being omitted from the decision.
 
 The runner accepts a programmatic real-session hook that drives the existing
 audio/model runtime and records events on `BenchmarkTimeline`. Record these
@@ -58,7 +58,7 @@ events to obtain latency metrics:
 ```text
 audio_received -> first_asr_partial
 turn_end -> first_llm_token
-first_llm_token -> first_audio_chunk
+turn_end -> first_audio_chunk (first playable audio)
 user_interrupt -> tts_stopped
 cancel_requested -> generation_cancelled
 ```
@@ -76,15 +76,37 @@ python3 scripts/run_realtime_acceptance.py \
   --report /tmp/realtime-model-integration.json
 ```
 
+The WAV must be PCM16 mono at 16 kHz. `--audio` drives the Task 13 production
+realtime/session path in paced 20 ms frames and captures its timeline; it is
+not copied into the report as an operator assertion. The runner derives
+latencies from captured events and issues `recorded-audio-realtime`
+provenance.
+
+For imported simulated metrics instead:
+
+```bash
+python3 scripts/run_realtime_acceptance.py \
+  --label simulated \
+  --metrics-json /tmp/realtime-simulated-metrics.json \
+  --report /tmp/realtime-simulated-acceptance.json
+```
+
 For real browser/headset validation:
 
 ```bash
 python3 scripts/run_realtime_acceptance.py \
   --profile local_gpu \
   --label hardware-e2e \
-  --explicit-real-run \
+  --browser-headset-driver /opt/voice-agent/bin/capture-browser-headset \
   --report /tmp/realtime-hardware-e2e.json
 ```
+
+The executable receives `--profile <profile>` and must perform the physical
+browser/headset run before printing a JSON object with captured `timeline`,
+non-latency `metrics`, and `environment`. The acceptance runner stamps
+`browser-headset` provenance only after that executable returns successfully;
+there is no flag-only hardware attestation. The report is written to a sibling
+temporary file and atomically replaced after the JSON is complete.
 
 For the external 60-minute soak gate, keep the runtime on the real deployment
 for one hour and confirm there is no unbounded queue growth, restart loop, CUDA
