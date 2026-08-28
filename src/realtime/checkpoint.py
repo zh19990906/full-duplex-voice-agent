@@ -58,6 +58,8 @@ class ResponseCheckpointStore:
         self._checkpoints: dict[str, ResponseCheckpoint] = {}
 
     def activate(self, response_id: str, *, generation_epoch: int) -> ResponseCheckpoint:
+        if response_id in self._checkpoints:
+            raise ValueError(f"response identity is already active: {response_id}")
         checkpoint = ResponseCheckpoint(response_id=response_id, generation_epoch=generation_epoch)
         self._checkpoints[response_id] = checkpoint
         return checkpoint

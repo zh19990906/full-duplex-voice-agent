@@ -4,6 +4,17 @@ from src.realtime.checkpoint import ResponseCheckpointStore
 
 
 class ResponseCheckpointStoreTests(unittest.TestCase):
+    def test_duplicate_response_identity_is_rejected_instead_of_overwriting_state(self):
+        store = ResponseCheckpointStore()
+        original = store.activate("response-1", generation_epoch=0)
+        store.record_generated_text("response-1", "already generated")
+
+        with self.assertRaisesRegex(ValueError, "response-1"):
+            store.activate("response-1", generation_epoch=1)
+
+        self.assertIs(store.get("response-1"), original)
+        self.assertEqual(original.generated_text, "already generated")
+
     def test_cursors_advance_monotonically_and_pause_preserves_reusable_audio(self):
         store = ResponseCheckpointStore()
         store.activate("response-1", generation_epoch=0)

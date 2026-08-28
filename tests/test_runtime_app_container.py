@@ -749,16 +749,51 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         async for item in runtime.events():
             events.append(item)
 
-        self.assertEqual(events[0]["event"], "AUDIO_FRAME_ACCEPTED")
-        self.assertEqual(events[1]["event"], "transcript")
-        self.assertEqual(events[2]["event"], "translation")
-        self.assertEqual(events[2]["payload"]["translated_text"], "Hello")
-        self.assertEqual(events[3]["event"], "audio_chunk")
+        self.assertEqual(events[0]["event"], "set_epoch")
+        self.assertEqual(events[1]["event"], "AUDIO_FRAME_ACCEPTED")
+        self.assertEqual(events[2]["event"], "transcript")
+        self.assertEqual(events[3]["event"], "translation")
+        self.assertEqual(events[3]["payload"]["translated_text"], "Hello")
+        self.assertEqual(events[4]["event"], "audio_chunk")
         self.assertEqual(tts_runtime.requests[0][0], "Hello")
         checkpoint = runtime.checkpoints.get(runtime.current_response_id)
         self.assertEqual(checkpoint.segments[0].text, "Hello")
         self.assertEqual(checkpoint.segments[0].audio, b"\x00\x00" * 4)
         self.assertEqual(len(translator_runtime.prompts), 1)
+
+    async def test_mode_switch_publishes_new_epoch_after_stopping_previous_response(self):
+        runtime = ServerRealtimeSessionRuntime(
+            "session-mode-boundary",
+            llm=_SharedLlmRuntime(),
+            tts=_SharedTtsRuntime(),
+        )
+        runtime.activate_response(runtime.next_response_id())
+
+        effect = await runtime.apply_controller_actions(
+            (
+                ControllerAction(
+                    ActionType.SWITCH_MODE,
+                    {
+                        "target_mode": "INTERPRETATION",
+                        "source_language": "Chinese",
+                        "target_language": "English",
+                    },
+                ),
+            )
+        )
+
+        events = []
+        while not runtime._events.empty():
+            events.append(runtime._events.get_nowait())
+
+        self.assertEqual(effect.advanced_epoch, 1)
+        self.assertEqual([item["event"] for item in events], ["stop_response", "set_epoch"])
+        self.assertEqual(events[0]["payload"]["response_id"], "response-1")
+        self.assertEqual(events[0]["payload"]["generation_epoch"], 0)
+        self.assertEqual(events[1]["response_id"], "response-2")
+        self.assertEqual(events[1]["generation_epoch"], 1)
+
+        await runtime.close()
 
     async def test_outbound_event_queue_full_closes_runtime_with_explicit_slow_consumer_error(self):
         runtime = ServerRealtimeSessionRuntime(

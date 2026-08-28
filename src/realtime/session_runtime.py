@@ -55,7 +55,7 @@ class RealtimeSessionRuntime:
             raise ValueError("session_id must not be empty")
         self.session_id = session_id
         self.generation_clock = GenerationClock()
-        self._interpretation_response_ids = IdentifierAllocator()
+        self._response_ids = IdentifierAllocator()
         self.ingress = ingress if ingress is not None else AudioIngress()
         self.playback = playback if playback is not None else PlaybackCoordinator()
         self.checkpoints = checkpoints if checkpoints is not None else self.playback.checkpoint_store
@@ -89,6 +89,10 @@ class RealtimeSessionRuntime:
         self.current_response_id = response_id
         self.checkpoints.activate(response_id, generation_epoch=self.generation_epoch)
         self.playback.set_active_response(response_id, generation_epoch=self.generation_epoch)
+
+    def next_response_id(self) -> str:
+        """Allocate the next response identity across every session mode."""
+        return self._response_ids.next_response_id()
 
     def record_generated_text(self, response_id: str, text: str) -> None:
         if response_id != self.current_response_id:
@@ -176,7 +180,7 @@ class RealtimeSessionRuntime:
                 await self._cancel_current_generation()
                 continue
             if action.action_type is ActionType.SWITCH_MODE:
-                self._apply_mode_switch(action)
+                effect.advanced_epoch = await self._apply_mode_switch(action)
                 continue
             if action.action_type is ActionType.PROCESS_USER_REQUEST:
                 if not revise_requested and self.current_response_id is not None:
@@ -251,32 +255,40 @@ class RealtimeSessionRuntime:
         if inspect.isawaitable(result):
             await result
 
-    def _apply_mode_switch(self, action: ControllerAction) -> None:
+    async def _apply_mode_switch(self, action: ControllerAction) -> int:
         payload = dict(action.payload or {})
         target_mode = payload.get("target_mode")
-        if target_mode == ConversationMode.CHAT.value:
-            self._exit_interpretation_mode()
-            return
-        if target_mode != ConversationMode.INTERPRETATION.value:
+        if target_mode not in {
+            ConversationMode.CHAT.value,
+            ConversationMode.INTERPRETATION.value,
+        }:
             raise ValueError("unsupported target_mode")
+        new_epoch = await self._begin_mode_transition()
+        if target_mode == ConversationMode.CHAT.value:
+            self.conversation_mode = ConversationMode.CHAT
+            return new_epoch
         target_language = payload.get("target_language")
         source_language = payload.get("source_language")
-        if self.interpretation_session is None:
-            self._build_interpretation_pipeline(
-                target_language=target_language,
-                source_language=source_language,
-            )
-        else:
-            self.interpretation_session.set_target_language(
-                target_language,
-                source_language=source_language,
-            )
-            if self._interpretation_pipeline is not None:
-                self._interpretation_pipeline.set_target_language(
-                    target_language,
-                    source_language=source_language,
-                )
         self.conversation_mode = ConversationMode.INTERPRETATION
+        self._build_interpretation_pipeline(
+            target_language=target_language,
+            source_language=source_language,
+        )
+        return new_epoch
+
+    async def _begin_mode_transition(self) -> int:
+        response_id = self.current_response_id
+        await self._cancel_current_generation()
+        if response_id is not None:
+            await self.playback.apply(ControllerAction(ActionType.STOP_RESPONSE))
+            checkpoint = self.checkpoints.get(response_id)
+            if checkpoint is not None:
+                self.checkpoints.discard_unplayed(response_id)
+        self._clear_interpretation_pipeline(clear_session=True)
+        new_epoch = self.generation_clock.advance()
+        self.current_response_id = None
+        self.playback.clear_active_response()
+        return new_epoch
 
     def _build_interpretation_pipeline(
         self,
@@ -289,7 +301,7 @@ class RealtimeSessionRuntime:
                 target_language=target_language,
                 source_language=source_language,
                 generation_clock=self.generation_clock,
-                response_id_factory=self._interpretation_response_ids.next_response_id,
+                response_id_factory=self.next_response_id,
             )
             self._interpretation_pipeline = None
             self._interpretation_cancellation = None
@@ -303,7 +315,7 @@ class RealtimeSessionRuntime:
             source_language=source_language,
             cancellation_token=cancellation,
             generation_clock=self.generation_clock,
-            response_id_factory=self._interpretation_response_ids.next_response_id,
+            response_id_factory=self.next_response_id,
         )
         self._interpretation_cancellation = cancellation
         self._interpretation_pipeline = pipeline

@@ -507,6 +507,18 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         if any(action.action_type is ActionType.PAUSE_RESPONSE for action in actions):
             self._response_resume_gate.clear()
         effect = await super().apply_controller_actions(actions)
+        if any(action.action_type is ActionType.SWITCH_MODE for action in actions):
+            await self._publish(
+                {
+                    "event": "set_epoch",
+                    "response_id": self.current_response_id,
+                    "generation_epoch": self.generation_epoch,
+                    "payload": {
+                        "response_id": self.current_response_id,
+                        "generation_epoch": self.generation_epoch,
+                    },
+                }
+            )
         if any(
             action.action_type
             in {
@@ -928,7 +940,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
 
     def _next_response_id(self) -> str:
         self._response_identifiers += 1
-        return f"response-{self._response_identifiers}"
+        return self.next_response_id()
 
     async def handle_policy_timeout(self, rationale: str = "policy timeout") -> None:
         self.session_state.floor = FloorState.USER
