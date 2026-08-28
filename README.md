@@ -73,17 +73,23 @@ port `8001`:
 python -m pip install fastapi uvicorn
 
 python scripts/run_real_server.py \
+  --asr-model /mnt/model-zhangheng/faster-whisper-large-v3 \
+  --turn-model /mnt/model-zhangheng/X2-Turn-4B-0812 \
+  --policy-model /mnt/model-zhangheng/Qwen2.5-14B-Instruct \
   --llm-model /mnt/model-zhangheng/Qwen2.5-14B-Instruct \
   --tts-model /mnt/model-zhangheng/Fun-CosyVoice3-0.5B-2512 \
   --prompt-audio /home/X2-Turn/turn-demo/assets/sample_en.wav \
   --prompt-text 'hello can you tell me what the weather is like today<|endofprompt|>' \
+  --host 0.0.0.0 \
+  --max-sessions 1 \
   --port 8001
 ```
 
-Open `http://服务器地址:8001`. This browser path currently supports text input
-through the real Qwen and CosyVoice models. Binary microphone messages return a
-clear notice because the checked-in X2-Turn local API performs offline whole-file
-inference rather than streaming raw browser audio.
+Open `http://服务器地址:8001`. The browser path supports binary PCM microphone
+streaming through realtime ASR, X2-Turn, semantic policy, Qwen, and CosyVoice.
+The server defaults to loopback and one heavyweight session; use `0.0.0.0` only
+on a trusted or access-controlled network because public authentication and
+Origin allow-listing are deployment responsibilities in this research build.
 
 ## Realtime acceptance
 
