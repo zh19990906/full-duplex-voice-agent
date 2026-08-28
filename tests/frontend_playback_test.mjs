@@ -523,6 +523,74 @@ test("websocket sends only the exact playback ACK payload while open", () => {
   assert.deepEqual(sent.map(JSON.parse), [{ type: "playback_ack", payload: acknowledgement }]);
 });
 
+test("websocket reconnects the same session with bounded exponential backoff", () => {
+  const previousWebSocket = globalThis.WebSocket;
+  const scheduled = [];
+  class FakeSocket {
+    static OPEN = 1;
+    static instances = [];
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.listeners = new Map();
+      FakeSocket.instances.push(this);
+    }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    close() { this.readyState = 3; this.listeners.get("close")?.(); }
+    emit(type, value = {}) { this.listeners.get(type)?.(value); }
+  }
+
+  try {
+    globalThis.WebSocket = FakeSocket;
+    const client = new AgentWebSocket("ws://example.test/ws", {
+      maxReconnectAttempts: 2,
+      reconnectDelayMs: 25,
+      schedule: (callback, delay) => { scheduled.push({ callback, delay }); return scheduled.length; },
+      cancelSchedule: () => {},
+    });
+    client.connect("session/reconnect");
+
+    FakeSocket.instances[0].emit("close");
+    assert.equal(scheduled[0].delay, 25);
+    scheduled[0].callback();
+    assert.equal(FakeSocket.instances[1].url, "ws://example.test/ws/session%2Freconnect");
+
+    FakeSocket.instances[1].emit("close");
+    assert.equal(scheduled[1].delay, 50);
+    scheduled[1].callback();
+    FakeSocket.instances[2].emit("close");
+
+    assert.equal(FakeSocket.instances.length, 3);
+    assert.equal(scheduled.length, 2);
+  } finally {
+    globalThis.WebSocket = previousWebSocket;
+  }
+});
+
+test("explicit websocket close suppresses reconnect", () => {
+  const previousWebSocket = globalThis.WebSocket;
+  const scheduled = [];
+  class FakeSocket {
+    static OPEN = 1;
+    constructor() { this.listeners = new Map(); this.readyState = 0; }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    close() { this.readyState = 3; this.listeners.get("close")?.(); }
+  }
+  try {
+    globalThis.WebSocket = FakeSocket;
+    const client = new AgentWebSocket("ws://example.test/ws", {
+      schedule: (callback, delay) => scheduled.push({ callback, delay }),
+    });
+    client.connect("session-1");
+
+    client.close();
+
+    assert.deepEqual(scheduled, []);
+  } finally {
+    globalThis.WebSocket = previousWebSocket;
+  }
+});
+
 test("app routes identity-aware audio and playback controls without closing new output", async () => {
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
@@ -567,6 +635,14 @@ test("app routes identity-aware audio and playback controls without closing new 
     await elements.get("create-session").trigger("click");
 
     FakeSocket.current.emit("message", { data: JSON.stringify({
+      event: "session_snapshot",
+      payload: {
+        generation_epoch: 7,
+        paused_responses: [{ response_id: "paused-from-snapshot" }],
+      },
+    }) });
+
+    FakeSocket.current.emit("message", { data: JSON.stringify({
       event: "audio", response_id: "root-response", generation_epoch: 8, segment_id: 9,
       payload: { audio_data: "AAABAA==", sample_rate: 24000, channels: 1 },
     }) });
@@ -579,8 +655,9 @@ test("app routes identity-aware audio and playback controls without closing new 
     ]) FakeSocket.current.emit("message", { data: JSON.stringify(event) });
     playbackOptions.onPlaybackAck({ response_id: "root-response", generation_epoch: 8, segment_id: 9, playback_attempt_id: 12, sample_offset: 2, audio_time: 1.5 });
 
-    assert.deepEqual(calls.slice(0, 8), [
+    assert.deepEqual(calls.slice(0, 10), [
       ["unlock"],
+      ["epoch", 7], ["pause", "paused-from-snapshot"],
       ["enqueue", { response_id: "root-response", generation_epoch: 8, segment_id: 9, audio_data: "AAABAA==", sample_rate: 24000, channels: 1 }],
       ["duck"], ["restore"], ["pause", "pause-me"],
       ["resume", { response_id: "pause-me", generation_epoch: 8, playback_attempt_id: 12 }],

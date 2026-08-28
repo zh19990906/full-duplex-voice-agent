@@ -28,24 +28,57 @@ const normalizeEventName = (name) => {
 };
 
 export class AgentWebSocket extends EventTarget {
-  constructor(url) {
+  constructor(url, {
+    maxReconnectAttempts = 5,
+    reconnectDelayMs = 250,
+    maxReconnectDelayMs = 4000,
+    schedule = (callback, delay) => setTimeout(callback, delay),
+    cancelSchedule = (handle) => clearTimeout(handle),
+  } = {}) {
     super();
     this.url = url;
     this.socket = null;
+    this.sessionId = null;
+    this.maxReconnectAttempts = maxReconnectAttempts;
+    this.reconnectDelayMs = reconnectDelayMs;
+    this.maxReconnectDelayMs = maxReconnectDelayMs;
+    this.schedule = schedule;
+    this.cancelSchedule = cancelSchedule;
+    this.reconnectAttempts = 0;
+    this.reconnectHandle = null;
+    this.closedExplicitly = false;
   }
 
   connect(sessionId) {
+    this.sessionId = sessionId;
+    this.closedExplicitly = false;
+    this.reconnectAttempts = 0;
+    this.#cancelReconnect();
+    return this.#open();
+  }
+
+  #open() {
     const separator = this.url.endsWith("/") ? "" : "/";
-    this.socket = new WebSocket(`${this.url}${separator}${encodeURIComponent(sessionId)}`);
-    this.socket.addEventListener("message", (message) => {
+    const socket = new WebSocket(`${this.url}${separator}${encodeURIComponent(this.sessionId)}`);
+    this.socket = socket;
+    socket.addEventListener("message", (message) => {
       const event = typeof message.data === "string" ? JSON.parse(message.data) : message.data;
       const type = normalizeEventName(event.event || event.type || "message");
       this.dispatchEvent(new CustomEvent(type, { detail: event }));
     });
-    this.socket.addEventListener("open", () => this.dispatchEvent(new Event("open")));
-    this.socket.addEventListener("close", () => this.dispatchEvent(new Event("close")));
-    this.socket.addEventListener("error", (error) => this.dispatchEvent(new CustomEvent("error", { detail: error })));
-    return this.socket;
+    socket.addEventListener("open", () => {
+      if (this.socket !== socket) return;
+      this.reconnectAttempts = 0;
+      this.dispatchEvent(new Event("open"));
+    });
+    socket.addEventListener("close", () => {
+      if (this.socket !== socket) return;
+      this.socket = null;
+      this.dispatchEvent(new Event("close"));
+      this.#scheduleReconnect();
+    });
+    socket.addEventListener("error", (error) => this.dispatchEvent(new CustomEvent("error", { detail: error })));
+    return socket;
   }
 
   sendText(text) {
@@ -75,8 +108,34 @@ export class AgentWebSocket extends EventTarget {
   }
 
   close() {
-    this.socket?.close();
+    this.closedExplicitly = true;
+    this.#cancelReconnect();
+    const socket = this.socket;
     this.socket = null;
+    socket?.close();
+  }
+
+  #scheduleReconnect() {
+    if (this.closedExplicitly || !this.sessionId) return;
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
+    const delay = Math.min(
+      this.reconnectDelayMs * (2 ** this.reconnectAttempts),
+      this.maxReconnectDelayMs,
+    );
+    this.reconnectAttempts += 1;
+    this.reconnectHandle = this.schedule(() => {
+      this.reconnectHandle = null;
+      if (!this.closedExplicitly) this.#open();
+    }, delay);
+    this.dispatchEvent(new CustomEvent("reconnecting", {
+      detail: { attempt: this.reconnectAttempts, delay },
+    }));
+  }
+
+  #cancelReconnect() {
+    if (this.reconnectHandle === null) return;
+    this.cancelSchedule(this.reconnectHandle);
+    this.reconnectHandle = null;
   }
 
   #sendJson(message) {

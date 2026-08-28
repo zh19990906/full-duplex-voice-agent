@@ -85,7 +85,14 @@ export function bootResearchConsole(
       if (type === "token") assistantMessage.append(envelope.payload?.text || "");
       if (type === "transcript") appendChat(type, envelope.payload?.text || "");
       if (type === "translation") appendChat("assistant", envelope.payload?.translated_text || "");
-      if (type === "session_snapshot") byId("agent-state").textContent = JSON.stringify(envelope.payload, null, 2);
+      if (type === "session_snapshot") {
+        const snapshot = envelope.payload || {};
+        playback.setEpoch(snapshot.generation_epoch ?? 0);
+        for (const paused of snapshot.paused_responses || []) {
+          if (paused?.response_id) playback.pauseResponse(paused.response_id);
+        }
+        byId("agent-state").textContent = JSON.stringify(snapshot, null, 2);
+      }
       if (type === "audio") playback.enqueue({
         response_id: eventField(envelope, "response_id"),
         generation_epoch: eventField(envelope, "generation_epoch", 0),
