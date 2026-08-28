@@ -386,6 +386,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         self._response_resume_gate = asyncio.Event()
         self._response_resume_gate.set()
         self._assistant_last_text = ""
+        self._last_user_request = ""
         self._playback_failed = False
         self._turn_transcript_text = ""
         self._turn_latest_transcript: TranscriptChunk | None = None
@@ -726,14 +727,23 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         if any(action.action_type is ActionType.PROCESS_USER_REQUEST for action in actions):
             text = transcript.text.strip() if transcript is not None else ""
             if text:
-                await self._start_generation(text)
+                await self._start_generation(text, policy_action=decision.action)
 
-    async def _start_generation(self, text: str) -> None:
+    async def _start_generation(
+        self,
+        text: str,
+        *,
+        policy_action: PolicyAction | None = None,
+    ) -> None:
         await self._cancel_generation()
         self._response_resume_gate.set()
-        await self._generation_slot.replace(self._run_generation(text))
+        await self._generation_slot.replace(self._run_generation(text, policy_action))
 
-    async def _run_generation(self, text: str) -> None:
+    async def _run_generation(
+        self,
+        text: str,
+        policy_action: PolicyAction | None = None,
+    ) -> None:
         await self._reset_provider(self.llm)
         await self._reset_provider(self.tts)
         epoch = self.advance_generation()
@@ -768,8 +778,9 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         )
         consumer = asyncio.create_task(self._consume_segments(queue, epoch, token))
         try:
-            result = await pipeline.run(self.prompt_builder(text))
+            result = await pipeline.run(self._build_generation_prompt(text, policy_action))
             self._assistant_last_text = result.text
+            self._last_user_request = text
             await consumer
             if not result.stale and not result.cancelled and not token.is_cancelled():
                 await self._publish(
@@ -819,6 +830,24 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                     pass
             if self._generation_token is token:
                 self._generation_token = None
+
+    def _build_generation_prompt(
+        self,
+        text: str,
+        policy_action: PolicyAction | None,
+    ) -> str:
+        if (
+            policy_action is PolicyAction.REVISE
+            and self._last_user_request
+            and self._assistant_last_text
+        ):
+            text = (
+                "请根据用户纠正重新回答，不要延续已被否定的方向。\n"
+                f"原始用户请求：{self._last_user_request}\n"
+                f"上一版助手回答：{self._assistant_last_text}\n"
+                f"用户纠正：{text}"
+            )
+        return self.prompt_builder(text)
 
     async def _publish_token(self, token: TokenChunk) -> None:
         self.record_generated_text(token.response_id or "", token.text)

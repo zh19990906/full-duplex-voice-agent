@@ -26,6 +26,7 @@ from src.model_runtime.manager import ModelMemoryBudgetError
 from src.realtime.cancellation import CancellationToken
 from src.realtime.policy import PolicyAction, PolicyDecision
 from src.realtime.text_segmenter import TextSegment
+from src.llm_runtime.stream import TokenChunk
 
 
 MODEL_CONFIG = {
@@ -100,6 +101,22 @@ class _SharedLlmRuntime:
 
     async def generate(self, _prompt, **_options):
         return ""
+
+
+class _ContextPromptLlm:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.prompts = []
+
+    async def stream_tokens(self, prompt, **_options):
+        self.prompts.append(prompt)
+        yield TokenChunk("captured", next(self.responses), 1.0, True)
+
+    async def cancel(self):
+        return None
+
+    def reset(self):
+        return None
 
 
 class _SharedTranslationRuntime:
@@ -952,6 +969,28 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.interpretation_session.target_language, "Japanese")
         self.assertNotEqual(runtime.current_response_id, old_response_id)
         self.assertEqual(translation.prompts, [])
+
+        await runtime.close()
+
+    async def test_revise_generation_prompt_includes_original_request_and_previous_answer(self):
+        llm = _ContextPromptLlm(("上海是一座城市。", "北京是中国的首都。"))
+        runtime = ServerRealtimeSessionRuntime(
+            "session-contextual-revise",
+            llm=llm,
+            tts=_SharedTtsRuntime(),
+        )
+
+        await runtime._start_generation("请介绍上海")
+        await runtime._generation_slot.task
+        await runtime._start_generation(
+            "不对，我说的是北京，不是上海",
+            policy_action=PolicyAction.REVISE,
+        )
+        await runtime._generation_slot.task
+
+        self.assertIn("请介绍上海", llm.prompts[1])
+        self.assertIn("上海是一座城市。", llm.prompts[1])
+        self.assertIn("不对，我说的是北京，不是上海", llm.prompts[1])
 
         await runtime.close()
 
