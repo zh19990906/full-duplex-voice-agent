@@ -661,6 +661,41 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         await session.close()
         await factory.close()
 
+    async def test_production_factory_reuses_chat_qwen_for_translation_by_default(self):
+        loaded = []
+        shared_llm = _SharedLlmRuntime()
+        runtimes = {
+            "asr": _SharedAsrRuntime(),
+            "turn": _SharedTurnRuntime(),
+            "policy": _SharedPolicyRuntime(),
+            "llm": shared_llm,
+            "tts": _SharedTtsRuntime(),
+            "translation": _SharedTranslationRuntime(),
+        }
+
+        def loader(name):
+            def load(_profile):
+                loaded.append(name)
+                return runtimes[name]
+            return load
+
+        factory = build_production_runtime_factory(
+            model_config=MODEL_CONFIG,
+            runtime_loaders={name: loader(name) for name in runtimes},
+        )
+
+        session = factory("session-shared-qwen")
+
+        self.assertNotIn("translation", loaded)
+        self.assertIs(
+            session.interpretation_translator.runtime.runtime,
+            session.llm.provider.runtime.runtime,
+        )
+        self.assertIs(session.llm.provider.runtime.runtime.runtime, shared_llm)
+
+        await session.close()
+        await factory.close()
+
     async def test_production_factory_shares_only_loaded_runtimes_and_isolates_stateful_wrappers(self):
         shared = {
             "asr": _SharedAsrRuntime(),
@@ -1127,7 +1162,7 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "asr close failed"):
             await factory.close()
 
-        self.assertEqual(set(closed), set(MODEL_CONFIG["models"]))
+        self.assertEqual(set(closed), set(MODEL_CONFIG["models"]) - {"translation"})
         self.assertEqual(factory.memory_diagnostics["models"], {})
         self.assertEqual(factory.memory_diagnostics["loaded_bytes"], 0)
         self.assertEqual(factory.memory_diagnostics["reserved_bytes"], 0)

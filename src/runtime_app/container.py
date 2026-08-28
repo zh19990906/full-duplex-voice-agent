@@ -1424,6 +1424,10 @@ def build_production_runtime_factory(
     loaders = dict(_default_runtime_loaders())
     loaders.update(runtime_loaders or {})
     memory_manager = _build_model_manager(model_config)
+    translation_profile = effective.get("translation")
+    separate_translation_runtime = bool(
+        translation_profile and translation_profile.get("separate_runtime", False)
+    )
     resolved_session_options = dict(session_options or {})
     if audio_config is not None:
         output_config = dict(audio_config.get("output", {}))
@@ -1469,7 +1473,10 @@ def build_production_runtime_factory(
     def resource_builder() -> dict[str, Any]:
         resources: dict[str, Any] = {}
         try:
-            for name in ("asr", "turn", "policy", "llm", "tts", "translation"):
+            resource_names = ["asr", "turn", "policy", "llm", "tts"]
+            if separate_translation_runtime:
+                resource_names.append("translation")
+            for name in resource_names:
                 profile = effective.get(name)
                 if profile:
                     resources[name] = _SharedRuntimeBoundary(load_resource(name, profile))
@@ -1509,11 +1516,15 @@ def build_production_runtime_factory(
                     provider=_SessionRuntimeProxy(resources["policy"]),
                 )
             )
-        translation_profile = effective.get("translation")
-        if translation_profile and "translation" in resources:
+        if translation_profile:
+            translation_resource = (
+                resources["translation"]
+                if separate_translation_runtime
+                else resources["llm"]
+            )
             components["interpretation_translator"] = QwenTranslationAdapter(
                 translation_profile["model_path"],
-                runtime=_SessionRuntimeProxy(resources["translation"]),
+                runtime=_SessionRuntimeProxy(translation_resource),
                 device=translation_profile.get("device", "cuda"),
                 options=translation_profile.get("options"),
             )
