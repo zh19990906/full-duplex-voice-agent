@@ -1,4 +1,11 @@
+import asyncio
+import queue
+import sys
+import threading
+import time
+import types
 import unittest
+from unittest.mock import patch
 
 from src.adapters.llm.providers.qwen_transformers import (
     TransformersQwenProvider,
@@ -27,7 +34,83 @@ class FakeQwenRuntime:
         self.cancelled = True
 
 
+async def _collect_async(iterable):
+    return [item async for item in iterable]
+
+
 class TransformersQwenProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transformers_cancel_waits_for_background_generate_to_stop(self):
+        started = threading.Event()
+        stopped = threading.Event()
+
+        class FakeTensor:
+            def to(self, _device):
+                return self
+
+        class FakeTokenizer:
+            def apply_chat_template(self, *_args, **_kwargs):
+                return {"input_ids": FakeTensor()}
+
+        class FakeModel:
+            def parameters(self):
+                yield types.SimpleNamespace(device="cpu")
+
+            def generate(self, **kwargs):
+                criteria = kwargs.get("stopping_criteria")
+                started.set()
+                deadline = time.monotonic() + 0.3
+                while time.monotonic() < deadline:
+                    if criteria is not None and criteria(None, None):
+                        break
+                    time.sleep(0.001)
+                stopped.set()
+
+        class FakeStreamer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if stopped.is_set():
+                    raise StopIteration
+                raise queue.Empty
+
+        class FakeStoppingCriteria:
+            pass
+
+        class FakeStoppingCriteriaList(list):
+            def __call__(self, input_ids, scores, **kwargs):
+                return any(item(input_ids, scores, **kwargs) for item in self)
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.TextIteratorStreamer = FakeStreamer
+        fake_transformers.StoppingCriteria = FakeStoppingCriteria
+        fake_transformers.StoppingCriteriaList = FakeStoppingCriteriaList
+        fake_torch = types.ModuleType("torch")
+        runtime = _TransformersRuntime(
+            FakeTokenizer(),
+            FakeModel(),
+            max_new_tokens=128,
+            temperature=0.0,
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"torch": fake_torch, "transformers": fake_transformers},
+        ):
+            consumer = asyncio.create_task(
+                _collect_async(runtime.stream_tokens("keep generating"))
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 0.2))
+
+            await runtime.cancel()
+            stopped_before_cancel_returned = stopped.is_set()
+            await asyncio.wait_for(consumer, timeout=0.5)
+
+            self.assertTrue(stopped_before_cancel_returned)
+
     async def test_injected_runtime_streams_tokens_without_transformers_dependency(self):
         runtime = FakeQwenRuntime()
         provider = TransformersQwenProvider("models/qwen", runtime=runtime)

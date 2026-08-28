@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import queue
+import threading
 import time
 from collections.abc import AsyncIterable, Mapping
 from typing import Any
@@ -173,10 +174,12 @@ class _TransformersRuntime:
             raise TypeError("model_options must be a mapping")
         self.generation_options = {**dict(nested_options), **generation_options}
         self._cancelled = False
+        self._generation_task: asyncio.Task[Any] | None = None
+        self._generation_stop: threading.Event | None = None
 
     async def stream_tokens(self, prompt: str, **options: Any) -> AsyncIterable[TokenChunk]:
         import torch
-        from transformers import TextIteratorStreamer
+        from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 
         self._cancelled = False
         messages = [{"role": "user", "content": prompt}]
@@ -207,10 +210,31 @@ class _TransformersRuntime:
             generation["do_sample"] = False
         else:
             generation.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
-        generation.update({"max_new_tokens": max_new_tokens, "streamer": streamer})
+        stop_event = threading.Event()
+
+        class CancellationCriteria(StoppingCriteria):
+            def __call__(self, _input_ids: Any, _scores: Any, **_kwargs: Any) -> bool:
+                return stop_event.is_set()
+
+        existing_criteria = generation.pop("stopping_criteria", ())
+        if existing_criteria is None:
+            existing_criteria = ()
+        if not isinstance(existing_criteria, (list, tuple)):
+            existing_criteria = (existing_criteria,)
+        generation.update(
+            {
+                "max_new_tokens": max_new_tokens,
+                "streamer": streamer,
+                "stopping_criteria": StoppingCriteriaList(
+                    [*existing_criteria, CancellationCriteria()]
+                ),
+            }
+        )
         generation_task = asyncio.create_task(
             asyncio.to_thread(self.model.generate, **inputs, **generation)
         )
+        self._generation_stop = stop_event
+        self._generation_task = generation_task
         try:
             index = 0
             while True:
@@ -230,8 +254,16 @@ class _TransformersRuntime:
             await generation_task
             yield TokenChunk(f"qwen-{index}", "", time.time(), True)
         finally:
+            stop_event.set()
             if not generation_task.done():
-                generation_task.cancel()
+                try:
+                    await asyncio.shield(generation_task)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if self._generation_task is generation_task:
+                self._generation_task = None
+            if self._generation_stop is stop_event:
+                self._generation_stop = None
 
     async def generate(self, prompt: str, **options: Any) -> str:
         chunks = [chunk async for chunk in self.stream_tokens(prompt, **options)]
@@ -239,6 +271,15 @@ class _TransformersRuntime:
 
     async def cancel(self) -> None:
         self._cancelled = True
+        stop_event = self._generation_stop
+        if stop_event is not None:
+            stop_event.set()
+        generation_task = self._generation_task
+        if generation_task is not None and not generation_task.done():
+            try:
+                await asyncio.shield(generation_task)
+            except (asyncio.CancelledError, Exception):
+                pass
 
     def reset(self) -> None:
         self._cancelled = False
