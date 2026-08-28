@@ -126,7 +126,12 @@ class AudioIngress:
         header, pcm = decode_audio_frame(frame)
         await self.push_decoded(RealtimeAudioFrame(header=header, pcm=pcm))
 
-    async def push_decoded(self, decoded: RealtimeAudioFrame) -> None:
+    async def push_decoded(
+        self,
+        decoded: RealtimeAudioFrame,
+        *,
+        yield_consumers: bool = True,
+    ) -> None:
         """Accept one already-decoded V1 browser frame."""
         if not isinstance(decoded, RealtimeAudioFrame):
             raise TypeError("decoded must be RealtimeAudioFrame")
@@ -147,7 +152,10 @@ class AudioIngress:
 
             self._deliver_contiguous(decoded)
         # A continuous producer must not starve independent consumer workers.
-        await asyncio.sleep(0)
+        # The server may defer this single yield until after it publishes the
+        # frame-accepted acknowledgement.
+        if yield_consumers:
+            await asyncio.sleep(0)
 
     async def flush(self) -> None:
         """Drain buffered frames in sorted order, record gaps, and await workers."""

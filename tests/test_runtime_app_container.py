@@ -4,9 +4,11 @@ import unittest
 from unittest.mock import patch
 
 from src.asr.stream import TranscriptChunk
+from src.adapters.turn.x2_turn_streaming import TurnCandidate
 from src.controller.actions import ActionType, ControllerAction
 from src.realtime.audio_ingress import RealtimeAudioFrame
 from src.realtime.protocol import AudioFrameHeader
+from src.realtime.speech_fusion import SpeechEventFusion
 from src.runtime_app.container import (
     _build_model_manager,
     _SharedRuntimeBoundary,
@@ -163,6 +165,60 @@ class _FakeStreamingAsr:
         self.cancelled = False
 
 
+class _BlockingStreamingAsr:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def push_pcm(self, _frame):
+        self.started.set()
+        await self.release.wait()
+        return None
+
+    async def finalize_turn(self):
+        return TranscriptChunk("blocking-final", "", 1.0, True, revision_id=1)
+
+
+class _BlockingTurn:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def push_pcm(self, _frame):
+        self.started.set()
+        await self.release.wait()
+        return ()
+
+
+class _SequencedTurn:
+    def __init__(self, end_on_call=2):
+        self.calls = 0
+        self.end_on_call = end_on_call
+
+    async def push_pcm(self, _frame):
+        self.calls += 1
+        if self.calls == self.end_on_call:
+            return (TurnCandidate("turn_end"),)
+        return ()
+
+
+class _PromptRecordingLlm:
+    def __init__(self):
+        self.prompts = []
+        self.called = asyncio.Event()
+
+    async def stream_tokens(self, prompt, **_options):
+        self.prompts.append(prompt)
+        self.called.set()
+        yield {"text": "ok", "is_final": True}
+
+    def reset(self):
+        return None
+
+    async def interrupt(self):
+        return None
+
+
 class _FakeTranslationRuntime:
     def __init__(self, translated_text="Hello"):
         self.translated_text = translated_text
@@ -268,6 +324,108 @@ class _LoaderCapture:
 
 
 class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_activity_duck_fast_path_does_not_wait_for_asr_or_turn_models(self):
+        asr = _BlockingStreamingAsr()
+        turn = _BlockingTurn()
+        runtime = ServerRealtimeSessionRuntime(
+            "session-fast-activity",
+            llm=_SharedLlmRuntime(),
+            tts=_SharedTtsRuntime(),
+            asr=asr,
+            turn=turn,
+        )
+        runtime.activate_response("response-playing")
+        runtime.session_state.response = runtime.session_state.response.PLAYING
+        runtime.session_state.floor = runtime.session_state.floor.ASSISTANT
+        frame = RealtimeAudioFrame(
+            AudioFrameHeader(sequence=0, capture_timestamp=1.0),
+            b"\xff\x7f" * 320,
+        )
+
+        accept_task = asyncio.create_task(runtime.accept_audio_frame(frame))
+        try:
+            await asyncio.wait_for(asr.started.wait(), 0.1)
+            await asyncio.wait_for(turn.started.wait(), 0.1)
+            await asyncio.wait_for(accept_task, 0.1)
+            events = []
+            while len(events) < 2:
+                events.append(await asyncio.wait_for(anext(runtime.events()), 0.1))
+
+            self.assertEqual(events[0]["event"], "AUDIO_FRAME_ACCEPTED")
+            self.assertEqual(events[1]["event"], "duck")
+        finally:
+            asr.release.set()
+            turn.release.set()
+            await asyncio.gather(accept_task, return_exceptions=True)
+            await runtime.flush()
+            await runtime.close()
+
+    async def test_turn_end_policy_receives_accumulated_asr_deltas(self):
+        llm = _PromptRecordingLlm()
+        runtime = ServerRealtimeSessionRuntime(
+            "session-full-turn",
+            llm=llm,
+            tts=_SharedTtsRuntime(),
+            asr=_FakeStreamingAsr(
+                [
+                    TranscriptChunk("chunk-1", "北京", 1.0, False, revision_id=1),
+                    TranscriptChunk("chunk-2", "天气", 2.0, False, revision_id=2),
+                ]
+            ),
+            turn=_SequencedTurn(),
+            fusion=SpeechEventFusion(turn_end_frames=1),
+            prompt_builder=lambda text: text,
+        )
+        for sequence in range(2):
+            await runtime.accept_audio_frame(
+                RealtimeAudioFrame(
+                    AudioFrameHeader(sequence=sequence, capture_timestamp=float(sequence)),
+                    b"\x00\x00" * 320,
+                )
+            )
+        await runtime.flush()
+        await asyncio.wait_for(llm.called.wait(), 0.2)
+
+        self.assertEqual(llm.prompts, ["北京天气"])
+        await runtime.close()
+
+    async def test_turn_end_policy_applies_authoritative_asr_replacement(self):
+        llm = _PromptRecordingLlm()
+        runtime = ServerRealtimeSessionRuntime(
+            "session-replaced-turn",
+            llm=llm,
+            tts=_SharedTtsRuntime(),
+            asr=_FakeStreamingAsr(
+                [
+                    TranscriptChunk("chunk-1", "我说上海", 1.0, False, revision_id=1),
+                    TranscriptChunk(
+                        "chunk-2",
+                        "",
+                        2.0,
+                        True,
+                        revision_id=2,
+                        committed_text="我说北京",
+                        replaces_committed=True,
+                    ),
+                ]
+            ),
+            turn=_SequencedTurn(),
+            fusion=SpeechEventFusion(turn_end_frames=1),
+            prompt_builder=lambda text: text,
+        )
+        for sequence in range(2):
+            await runtime.accept_audio_frame(
+                RealtimeAudioFrame(
+                    AudioFrameHeader(sequence=sequence, capture_timestamp=float(sequence)),
+                    b"\x00\x00" * 320,
+                )
+            )
+        await runtime.flush()
+        await asyncio.wait_for(llm.called.wait(), 0.2)
+
+        self.assertEqual(llm.prompts, ["我说北京"])
+        await runtime.close()
+
     async def test_owner_llm_cancel_reaches_shared_runtime_while_stream_is_blocked(self):
         runtime = _BlockingRuntime()
         boundary = _SharedRuntimeBoundary(runtime)

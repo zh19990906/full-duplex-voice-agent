@@ -16,7 +16,7 @@ from src.controller.actions import ActionType, ControllerAction
 from src.controller.controller import ConversationController
 from src.generation.manager import GenerationManager
 from src.llm_runtime.stream import TokenChunk
-from src.realtime.audio_ingress import RealtimeAudioFrame
+from src.realtime.audio_ingress import AudioActivityCandidate, AudioIngress, RealtimeAudioFrame
 from src.realtime.cancellation import ActiveTaskSlot, CancellationToken
 from src.realtime.playback import PlaybackCoordinator
 from src.realtime.policy import PolicyRequest, SemanticPolicyEngine
@@ -385,11 +385,31 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         self._generation_token: CancellationToken | None = None
         self._assistant_last_text = ""
         self._playback_failed = False
+        self._turn_transcript_text = ""
+        self._turn_latest_transcript: TranscriptChunk | None = None
+        self._turn_transcript_revision = -1
+        self._turn_transcript_lock = asyncio.Lock()
+        self._asr_progress = asyncio.Condition()
+        self._asr_processed_sequence = -1
+        ingress = AudioIngress(
+            asr_consumer=(
+                self._consume_asr_frame
+                if asr is not None and callable(getattr(asr, "push_pcm", None))
+                else None
+            ),
+            turn_consumer=(
+                self._consume_turn_frame
+                if turn is not None and callable(getattr(turn, "push_pcm", None))
+                else None
+            ),
+            activity_consumer=self._consume_activity_candidate,
+        )
         self._sender_playback = PlaybackCoordinator(send_command=self._publish_command)
         self._tts_supervisor = WorkerSupervisor("tts_worker", max_restarts=1)
         self._runtime_interpretation_sink = interpretation_sink or RuntimeBackedTranslationSink(self)
         super().__init__(
             session_id,
+            ingress=ingress,
             playback=self._sender_playback,
             cancel_generation=self._cancel_generation_hook,
             interpretation_translator=interpretation_translator,
@@ -427,7 +447,9 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                 return
 
     async def accept_audio_frame(self, frame: RealtimeAudioFrame) -> None:
-        await super().accept_audio_frame(frame)
+        if self.closed:
+            raise RuntimeError("realtime session runtime is closed")
+        await self.ingress.push_decoded(frame, yield_consumers=False)
         await self._publish(
             {
                 "event": "AUDIO_FRAME_ACCEPTED",
@@ -436,7 +458,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                 "payload": {"sequence": frame.header.sequence},
             }
         )
-        await self._process_audio_frame(frame)
+        await asyncio.sleep(0)
 
     async def accept_command(self, command: Mapping[str, Any]) -> None:
         if not isinstance(command, Mapping):
@@ -489,23 +511,32 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         except asyncio.QueueFull:
             pass
 
-    async def _process_audio_frame(self, frame: RealtimeAudioFrame) -> None:
-        transcript: TranscriptChunk | None = None
-        if self.asr is not None and callable(getattr(self.asr, "push_pcm", None)):
-            try:
-                transcript = await self.asr.push_pcm(frame)
-            except Exception as exc:
-                await self.handle_asr_failure(exc)
-                return
+    async def _consume_activity_candidate(self, candidate: AudioActivityCandidate) -> None:
+        for fusion_event in self.fusion.accept_activity(candidate):
+            actions = self.controller.handle_candidate(self.session_state, fusion_event)
+            if actions:
+                await self.apply_controller_actions(actions)
+
+    async def _consume_asr_frame(self, frame: RealtimeAudioFrame) -> None:
+        try:
+            transcript = await self.asr.push_pcm(frame)
             if transcript is not None:
-                await self._publish({"event": "transcript", "payload": transcript.to_dict()})
-                self.fusion.accept_transcript(transcript)
-                await self._route_transcript_to_interpretation(transcript)
-        if self.turn is None or not callable(getattr(self.turn, "push_pcm", None)):
-            return
+                await self._accept_transcript_update(transcript)
+        except Exception as exc:
+            await self.handle_asr_failure(exc)
+        finally:
+            async with self._asr_progress:
+                self._asr_processed_sequence = max(
+                    self._asr_processed_sequence,
+                    frame.sequence,
+                )
+                self._asr_progress.notify_all()
+
+    async def _consume_turn_frame(self, frame: RealtimeAudioFrame) -> None:
         try:
             turn_candidates = await self.turn.push_pcm(frame)
         except (asyncio.TimeoutError, TimeoutError):
+            transcript = await self._turn_transcript_snapshot()
             await self._handle_turn_timeout(transcript, frame)
             return
         for candidate in turn_candidates:
@@ -514,10 +545,72 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                 if tentative:
                     await self.apply_controller_actions(tentative)
                 if fusion_event.event == "USER_TURN_END_CANDIDATE":
+                    await self._wait_for_asr_sequence(frame.sequence)
+                    transcript = await self._turn_transcript_snapshot()
                     transcript = await self._finalize_turn_transcript(transcript)
                     await self._apply_policy(fusion_event, transcript)
+                    await self._reset_turn_transcript()
                 elif fusion_event.event == "USER_BACKCHANNEL_CANDIDATE":
+                    transcript = await self._turn_transcript_snapshot()
                     await self._apply_policy(fusion_event, transcript)
+
+    async def _wait_for_asr_sequence(self, sequence: int) -> None:
+        if self.asr is None:
+            return
+        async with self._asr_progress:
+            try:
+                await asyncio.wait_for(
+                    self._asr_progress.wait_for(
+                        lambda: self._asr_processed_sequence >= sequence
+                    ),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                # Finalization still has a chance to obtain authoritative text;
+                # a dropped/failed ASR frame must not deadlock the turn worker.
+                return
+
+    async def _accept_transcript_update(self, chunk: TranscriptChunk) -> TranscriptChunk:
+        await self._publish({"event": "transcript", "payload": chunk.to_dict()})
+        async with self._turn_transcript_lock:
+            if chunk.revision_id >= self._turn_transcript_revision:
+                if chunk.replaces_committed:
+                    self._turn_transcript_text = chunk.committed_text or ""
+                else:
+                    self._turn_transcript_text += chunk.text
+                self._turn_transcript_revision = chunk.revision_id
+                self._turn_latest_transcript = chunk
+            full_chunk = self._full_turn_chunk_locked()
+        self.fusion.accept_transcript(full_chunk)
+        await self._route_transcript_to_interpretation(chunk)
+        return full_chunk
+
+    async def _turn_transcript_snapshot(self) -> TranscriptChunk | None:
+        async with self._turn_transcript_lock:
+            if self._turn_latest_transcript is None:
+                return None
+            return self._full_turn_chunk_locked()
+
+    def _full_turn_chunk_locked(self) -> TranscriptChunk:
+        latest = self._turn_latest_transcript
+        if latest is None:
+            raise RuntimeError("turn transcript is unavailable")
+        return TranscriptChunk(
+            chunk_id=latest.chunk_id,
+            text=self._turn_transcript_text,
+            timestamp=latest.timestamp,
+            is_final=latest.is_final,
+            revision_id=latest.revision_id,
+            unstable_text=latest.unstable_text,
+            committed_text=self._turn_transcript_text if latest.is_final else None,
+            replaces_committed=False,
+        )
+
+    async def _reset_turn_transcript(self) -> None:
+        async with self._turn_transcript_lock:
+            self._turn_transcript_text = ""
+            self._turn_latest_transcript = None
+            self._turn_transcript_revision = -1
 
     async def _finalize_turn_transcript(
         self, transcript: TranscriptChunk | None
@@ -530,10 +623,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             await self.handle_asr_failure(exc)
             return None
         if final_chunk.text or final_chunk.is_final:
-            await self._publish({"event": "transcript", "payload": final_chunk.to_dict()})
-            self.fusion.accept_transcript(final_chunk)
-            await self._route_transcript_to_interpretation(final_chunk)
-            return final_chunk
+            return await self._accept_transcript_update(final_chunk)
         return transcript
 
     async def _apply_policy(
