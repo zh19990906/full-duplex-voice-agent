@@ -383,6 +383,8 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         self._terminal_error: BaseException | None = None
         self._generation_slot = ActiveTaskSlot()
         self._generation_token: CancellationToken | None = None
+        self._response_resume_gate = asyncio.Event()
+        self._response_resume_gate.set()
         self._assistant_last_text = ""
         self._playback_failed = False
         self._turn_transcript_text = ""
@@ -497,6 +499,25 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             )
             return
         raise ValueError(f"unsupported command type: {command_type or '<empty>'}")
+
+    async def apply_controller_actions(
+        self,
+        actions: tuple[ControllerAction, ...],
+    ):
+        if any(action.action_type is ActionType.PAUSE_RESPONSE for action in actions):
+            self._response_resume_gate.clear()
+        effect = await super().apply_controller_actions(actions)
+        if any(
+            action.action_type
+            in {
+                ActionType.RESUME_RESPONSE,
+                ActionType.STOP_RESPONSE,
+                ActionType.CANCEL_GENERATION,
+            }
+            for action in actions
+        ):
+            self._response_resume_gate.set()
+        return effect
 
     async def close(self) -> None:
         if self._closed_stream:
@@ -660,6 +681,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
 
     async def _start_generation(self, text: str) -> None:
         await self._cancel_generation()
+        self._response_resume_gate.set()
         await self._generation_slot.replace(self._run_generation(text))
 
     async def _run_generation(self, text: str) -> None:
@@ -768,6 +790,9 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                     continue
                 if isinstance(item, ResponseStreamEnd):
                     return
+                await self._response_resume_gate.wait()
+                if token.is_cancelled() or not self.generation_clock.is_current(epoch):
+                    return
                 self.record_response_segment(item)
                 keep_running = await self._stream_tts_segment(item, epoch, token)
                 if not keep_running:
@@ -824,6 +849,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         token = self._generation_token
         if token is not None:
             token.cancel()
+        self._response_resume_gate.set()
         await self._generation_slot.cancel()
         await self._interrupt_provider(self.llm)
         await self._interrupt_provider(self.tts)

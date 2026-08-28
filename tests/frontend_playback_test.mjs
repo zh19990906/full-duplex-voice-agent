@@ -120,6 +120,26 @@ test("coordinator pauses only the named response and leaves unrelated output que
   assert.equal(context.closeCalls, 0);
 });
 
+test("coordinator parks audio that arrives after a response is paused", () => {
+  const { coordinator, port } = createCoordinator();
+  coordinator.setEpoch(4);
+  coordinator.pauseResponse("paused-later");
+
+  coordinator.enqueue(item("paused-later", 4, 7));
+
+  assert.equal(port.messages.some((message) => message.type === "enqueue"), false);
+  assert.deepEqual(coordinator.queue.paused.map(({ segment_id }) => segment_id), [7]);
+
+  coordinator.resumeResponse({
+    response_id: "paused-later",
+    generation_epoch: 4,
+    playback_attempt_id: 2,
+  });
+  assert.equal(port.messages.at(-1).type, "enqueue");
+  assert.equal(port.messages.at(-1).item.segment_id, 7);
+  assert.equal(port.messages.at(-1).item.playback_attempt_id, 2);
+});
+
 test("coordinator resumes paused partial and tail segments in order under one fresh attempt", () => {
   const { coordinator, port, acknowledgements } = createCoordinator();
   const segment = (segment_id, samples) => ({
@@ -448,7 +468,10 @@ test("pre-init pause and stop emit terminal zero-offset acknowledgements", () =>
     { response_id: "stop-before-init", generation_epoch: 4, segment_id: 2, sample_offset: 0, audio_time: 12.5 },
   ]);
   assert.deepEqual(coordinator.queue.pending, []);
-  assert.deepEqual(coordinator.queue.paused, []);
+  assert.deepEqual(
+    coordinator.queue.paused.map(({ response_id }) => response_id),
+    ["pause-before-init"],
+  );
 });
 
 test("worklet renderer plays 24kHz PCM at the correct 48kHz AudioContext speed and reports source offsets", () => {

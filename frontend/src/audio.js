@@ -141,6 +141,7 @@ export class PlaybackQueue {
     this.pending = [];
     this.active = [];
     this.paused = [];
+    this.pausedResponses = new Set();
   }
 
   get staleAudioCount() {
@@ -161,7 +162,8 @@ export class PlaybackQueue {
   enqueue(item) {
     if (!item || item.generation_epoch < this.currentEpoch) return false;
     if (item.generation_epoch > this.currentEpoch) this.setEpoch(item.generation_epoch);
-    this.pending.push(item);
+    if (this.pausedResponses.has(item.response_id)) this.paused.push(item);
+    else this.pending.push(item);
     return true;
   }
 
@@ -173,6 +175,7 @@ export class PlaybackQueue {
   }
 
   pauseResponse(responseId) {
+    this.pausedResponses.add(responseId);
     const matches = (item) => item.response_id === responseId;
     const paused = [...this.active.filter(matches), ...this.pending.filter(matches)];
     this.pending = this.pending.filter((item) => !matches(item));
@@ -182,6 +185,7 @@ export class PlaybackQueue {
   }
 
   stopResponse(responseId) {
+    this.pausedResponses.delete(responseId);
     const matches = (item) => item.response_id === responseId;
     const stopped = [...this.pending.filter(matches), ...this.active.filter(matches), ...this.paused.filter(matches)];
     this.pending = this.pending.filter((item) => !matches(item));
@@ -200,6 +204,7 @@ export class PlaybackQueue {
   }
 
   resumeResponse(responseId, epoch, playbackAttemptId) {
+    this.pausedResponses.delete(responseId);
     const resumed = [];
     const retained = [];
     for (const item of this.paused) {
@@ -224,6 +229,7 @@ export class PlaybackQueue {
     this.pending = [];
     this.active = [];
     this.paused = [];
+    this.pausedResponses.clear();
   }
 }
 
@@ -399,10 +405,11 @@ export class BrowserPlaybackCoordinator {
 
   #sendItem(item) {
     if (!this.queue.markActive(item.response_id, item.generation_epoch, item.segment_id, item.playback_attempt_id)) return;
+    const transferablePcm = item.pcm16.slice();
     this.workletNode.port.postMessage({
       type: "enqueue",
-      item: { ...item, pcm16: item.pcm16.buffer },
-    }, [item.pcm16.buffer]);
+      item: { ...item, pcm16: transferablePcm.buffer },
+    }, [transferablePcm.buffer]);
   }
 
   #handleWorkletEvent(event, token = this.lifecycleGeneration, worklet = this.workletNode) {
@@ -457,7 +464,9 @@ export class BrowserPlaybackCoordinator {
         sample_offset: 0,
         audio_time,
       });
-      this.queue.complete(item.response_id, item.generation_epoch, item.segment_id, item.playback_attempt_id);
+      if (type === "stopped") {
+        this.queue.complete(item.response_id, item.generation_epoch, item.segment_id, item.playback_attempt_id);
+      }
     }
   }
 

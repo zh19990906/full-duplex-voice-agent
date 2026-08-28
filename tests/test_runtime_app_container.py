@@ -8,6 +8,7 @@ from src.adapters.turn.x2_turn_streaming import TurnCandidate
 from src.controller.actions import ActionType, ControllerAction
 from src.realtime.audio_ingress import RealtimeAudioFrame
 from src.realtime.protocol import AudioFrameHeader
+from src.realtime.response_pipeline import ResponseStreamEnd
 from src.realtime.speech_fusion import SpeechEventFusion
 from src.runtime_app.container import (
     _build_model_manager,
@@ -324,6 +325,34 @@ class _LoaderCapture:
 
 
 class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_paused_response_gates_future_tts_until_resume(self):
+        tts = _SharedTtsRuntime()
+        runtime = ServerRealtimeSessionRuntime(
+            "session-pause-gate",
+            llm=_SharedLlmRuntime(),
+            tts=tts,
+        )
+        runtime.activate_response("response-paused")
+        await runtime.apply_controller_actions(
+            (ControllerAction(ActionType.PAUSE_RESPONSE),)
+        )
+        queue = asyncio.Queue()
+        await queue.put(TextSegment(0, "稍后继续。", False, "response-paused", 0))
+        await queue.put(ResponseStreamEnd("response-paused", 0, 0))
+        consumer = asyncio.create_task(
+            runtime._consume_segments(queue, 0, CancellationToken())
+        )
+
+        await asyncio.sleep(0.02)
+        self.assertEqual(tts.requests, [])
+
+        await runtime.apply_controller_actions(
+            (ControllerAction(ActionType.RESUME_RESPONSE),)
+        )
+        await asyncio.wait_for(consumer, 0.2)
+        self.assertEqual([request[0] for request in tts.requests], ["稍后继续。"])
+        await runtime.close()
+
     async def test_activity_duck_fast_path_does_not_wait_for_asr_or_turn_models(self):
         asr = _BlockingStreamingAsr()
         turn = _BlockingTurn()
