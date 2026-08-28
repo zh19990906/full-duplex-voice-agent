@@ -127,6 +127,29 @@ class RealtimeBootstrapTests(unittest.TestCase):
         settings = RealtimeServerSettings(static_dir=Path("frontend"))
 
         self.assertEqual(settings.port, 8001)
+        self.assertEqual(settings.host, "127.0.0.1")
+        self.assertEqual(settings.max_sessions, 1)
+
+    def test_session_capacity_rejects_second_runtime_before_loading_models(self):
+        runtimes = []
+
+        def factory(_session_id):
+            runtime = RecordingRealtimeRuntime()
+            runtimes.append(runtime)
+            return runtime
+
+        settings = RealtimeServerSettings(static_dir=Path("frontend"), max_sessions=1)
+        with patch.dict(sys.modules, _fake_fastapi_modules()):
+            app = build_realtime_app(settings, runtime_factory=factory)
+            create_session = app.http_endpoints[("POST", "/sessions")]
+
+            first = asyncio.run(create_session())
+            second = asyncio.run(create_session())
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.body["error"], "session capacity reached")
+        self.assertEqual(len(runtimes), 1)
 
     def test_build_realtime_app_keeps_runtime_factory_on_app_state(self):
         settings = RealtimeServerSettings(static_dir=Path("frontend"))

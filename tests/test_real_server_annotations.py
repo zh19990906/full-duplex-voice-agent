@@ -34,6 +34,11 @@ class _FakeFastAPI:
 
 
 class RealServerAnnotationTests(unittest.TestCase):
+    def test_command_line_defaults_to_loopback_host(self):
+        args = run_real_server.parse_args([])
+
+        self.assertEqual(args.host, "127.0.0.1")
+
     def test_websocket_endpoint_annotations_resolve_for_framework_injection(self):
         class WebSocket:
             pass

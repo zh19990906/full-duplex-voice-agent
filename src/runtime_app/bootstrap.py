@@ -62,8 +62,13 @@ class RealtimeServerSettings:
     """Stable server settings for the realtime app composition root."""
 
     static_dir: Path
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8001
+    max_sessions: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.max_sessions) is not int or self.max_sessions < 1:
+            raise ValueError("max_sessions must be a positive integer")
 
 
 def build_realtime_app(
@@ -83,6 +88,7 @@ def build_realtime_app(
     globals()["WebSocketDisconnect"] = WebSocketDisconnect
 
     sessions: dict[str, Any] = {}
+    session_lock = asyncio.Lock()
     static_dir = settings.static_dir.resolve()
 
     @asynccontextmanager
@@ -111,10 +117,16 @@ def build_realtime_app(
 
     @app.post("/sessions")
     async def create_session():
-        session_id = uuid.uuid4().hex
-        runtime = runtime_factory(session_id)
-        await _maybe_call(runtime, "start")
-        sessions[session_id] = runtime
+        async with session_lock:
+            if len(sessions) >= settings.max_sessions:
+                return JSONResponse(
+                    {"error": "session capacity reached"},
+                    status_code=429,
+                )
+            session_id = uuid.uuid4().hex
+            runtime = runtime_factory(session_id)
+            await _maybe_call(runtime, "start")
+            sessions[session_id] = runtime
         return JSONResponse({"session_id": session_id, "status": "CREATED"}, status_code=201)
 
     @app.get("/sessions/{session_id}")

@@ -43,8 +43,9 @@ def build_app(args: argparse.Namespace):
     )
     settings = RealtimeServerSettings(
         static_dir=ROOT / "frontend",
-        host=getattr(args, "host", "0.0.0.0"),
+        host=getattr(args, "host", "127.0.0.1"),
         port=getattr(args, "port", 8001),
+        max_sessions=getattr(args, "max_sessions", 1),
     )
     # build_realtime_app still constructs FastAPI(..., lifespan=lifespan).
     return build_realtime_app(settings, runtime_factory=runtime_factory)
@@ -67,8 +68,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tts-model", default=os.environ.get("VOICE_AGENT_TTS_MODEL"))
     parser.add_argument("--prompt-audio", default=os.environ.get("VOICE_AGENT_PROMPT_AUDIO"))
     parser.add_argument("--prompt-text", default=os.environ.get("VOICE_AGENT_PROMPT_TEXT"))
-    parser.add_argument("--host", default=os.environ.get("VOICE_AGENT_HOST", "0.0.0.0"))
+    parser.add_argument("--host", default=os.environ.get("VOICE_AGENT_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("VOICE_AGENT_PORT", "8001")))
+    parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=int(os.environ.get("VOICE_AGENT_MAX_SESSIONS", "1")),
+    )
     parser.add_argument(
         "--worker-startup-timeout",
         type=float,
