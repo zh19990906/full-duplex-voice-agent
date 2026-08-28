@@ -9,7 +9,7 @@ from src.controller.actions import ActionType, ControllerAction
 from src.realtime.audio_ingress import RealtimeAudioFrame
 from src.realtime.protocol import AudioFrameHeader
 from src.realtime.response_pipeline import ResponseStreamEnd
-from src.realtime.speech_fusion import SpeechEventFusion
+from src.realtime.speech_fusion import SpeechCandidateEvent, SpeechEventFusion
 from src.runtime_app.container import (
     _build_model_manager,
     _SharedRuntimeBoundary,
@@ -24,6 +24,7 @@ from src.runtime_app.container import (
 )
 from src.model_runtime.manager import ModelMemoryBudgetError
 from src.realtime.cancellation import CancellationToken
+from src.realtime.policy import PolicyAction, PolicyDecision
 from src.realtime.text_segmenter import TextSegment
 
 
@@ -80,6 +81,16 @@ class _SharedPolicyRuntime:
         return (
             '{"action":"UNCERTAIN","confidence":0.0,"rationale":"no-op"}'
         )
+
+
+class _RecordingModePolicy:
+    def __init__(self, decision):
+        self.decision = decision
+        self.requests = []
+
+    async def decide(self, request):
+        self.requests.append(request)
+        return self.decision
 
 
 class _SharedLlmRuntime:
@@ -792,6 +803,120 @@ class RuntimeAppContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["payload"]["generation_epoch"], 0)
         self.assertEqual(events[1]["response_id"], "response-2")
         self.assertEqual(events[1]["generation_epoch"], 1)
+
+        await runtime.close()
+
+    async def test_stop_interpretation_control_is_classified_before_translation(self):
+        translation = _SharedTranslationRuntime("should not be emitted")
+        policy = _RecordingModePolicy(
+            PolicyDecision(
+                action=PolicyAction.MODE_SWITCH,
+                confidence=0.98,
+                rationale="explicitly stop continuous interpretation",
+                intent="chat",
+            )
+        )
+        runtime = ServerRealtimeSessionRuntime(
+            "session-stop-interpretation",
+            llm=_SharedLlmRuntime(),
+            tts=_SharedTtsRuntime(),
+            policy_engine=policy,
+            interpretation_translator=type(
+                "Translator",
+                (),
+                {
+                    "__init__": lambda self, provider: setattr(self, "provider", provider),
+                    "translate_stream": lambda self, prompt: self.provider.generate(prompt),
+                },
+            )(translation),
+        )
+        await runtime.apply_controller_actions(
+            (
+                ControllerAction(
+                    ActionType.SWITCH_MODE,
+                    {
+                        "target_mode": "INTERPRETATION",
+                        "source_language": "Chinese",
+                        "target_language": "English",
+                    },
+                ),
+            )
+        )
+
+        await runtime._accept_transcript_update(
+            TranscriptChunk("control-1", "停止同传", 1.0, True, revision_id=1)
+        )
+
+        self.assertEqual(runtime.conversation_mode.value, "CHAT")
+        self.assertIsNone(runtime.current_response_id)
+        self.assertEqual(translation.prompts, [])
+        self.assertEqual(policy.requests[0].user_transcript.text, "停止同传")
+        epoch_after_control = runtime.generation_epoch
+
+        await runtime._apply_policy(
+            SpeechCandidateEvent(
+                event="USER_TURN_END_CANDIDATE",
+                event_id="turn-end-control-1",
+                timestamp=1.1,
+                source="turn",
+                payload={"label": "turn_end", "confidence": 1.0},
+            ),
+            await runtime._turn_transcript_snapshot(),
+        )
+
+        self.assertEqual(len(policy.requests), 1)
+        self.assertEqual(runtime.generation_epoch, epoch_after_control)
+
+        await runtime.close()
+
+    async def test_change_interpretation_language_control_rotates_response_without_translation(self):
+        translation = _SharedTranslationRuntime("should not be emitted")
+        policy = _RecordingModePolicy(
+            PolicyDecision(
+                action=PolicyAction.MODE_SWITCH,
+                confidence=0.97,
+                rationale="change persistent target language",
+                intent="continuous_interpretation",
+                source_language="Chinese",
+                target_language="Japanese",
+            )
+        )
+        runtime = ServerRealtimeSessionRuntime(
+            "session-change-language",
+            llm=_SharedLlmRuntime(),
+            tts=_SharedTtsRuntime(),
+            policy_engine=policy,
+            interpretation_translator=type(
+                "Translator",
+                (),
+                {
+                    "__init__": lambda self, provider: setattr(self, "provider", provider),
+                    "translate_stream": lambda self, prompt: self.provider.generate(prompt),
+                },
+            )(translation),
+        )
+        await runtime.apply_controller_actions(
+            (
+                ControllerAction(
+                    ActionType.SWITCH_MODE,
+                    {
+                        "target_mode": "INTERPRETATION",
+                        "source_language": "Chinese",
+                        "target_language": "English",
+                    },
+                ),
+            )
+        )
+        old_response_id = runtime.current_response_id
+
+        await runtime._accept_transcript_update(
+            TranscriptChunk("control-2", "接下来改成日语", 2.0, True, revision_id=1)
+        )
+
+        self.assertEqual(runtime.conversation_mode.value, "INTERPRETATION")
+        self.assertEqual(runtime.interpretation_session.target_language, "Japanese")
+        self.assertNotEqual(runtime.current_response_id, old_response_id)
+        self.assertEqual(translation.prompts, [])
 
         await runtime.close()
 

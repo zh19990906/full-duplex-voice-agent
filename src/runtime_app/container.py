@@ -19,7 +19,7 @@ from src.llm_runtime.stream import TokenChunk
 from src.realtime.audio_ingress import AudioActivityCandidate, AudioIngress, RealtimeAudioFrame
 from src.realtime.cancellation import ActiveTaskSlot, CancellationToken
 from src.realtime.playback import PlaybackCoordinator
-from src.realtime.policy import PolicyRequest, SemanticPolicyEngine
+from src.realtime.policy import PolicyAction, PolicyRequest, SemanticPolicyEngine
 from src.realtime.response_pipeline import RealtimeResponsePipeline, ResponseStreamEnd
 from src.realtime.interpretation import TranslationSegment
 from src.realtime.supervisor import WorkerSupervisor, WorkerTerminalEvent
@@ -390,6 +390,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         self._turn_transcript_text = ""
         self._turn_latest_transcript: TranscriptChunk | None = None
         self._turn_transcript_revision = -1
+        self._turn_control_consumed = False
         self._turn_transcript_lock = asyncio.Lock()
         self._asr_progress = asyncio.Condition()
         self._asr_processed_sequence = -1
@@ -614,9 +615,42 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
                 self._turn_transcript_revision = chunk.revision_id
                 self._turn_latest_transcript = chunk
             full_chunk = self._full_turn_chunk_locked()
-        self.fusion.accept_transcript(full_chunk)
-        await self._route_transcript_to_interpretation(chunk)
+        candidates = self.fusion.accept_transcript(full_chunk)
+        handled_as_control = await self._apply_interpretation_control_policy(
+            full_chunk,
+            candidates[0] if candidates else None,
+        )
+        if not handled_as_control:
+            await self._route_transcript_to_interpretation(chunk)
         return full_chunk
+
+    async def _apply_interpretation_control_policy(
+        self,
+        transcript: TranscriptChunk,
+        candidate: Any | None,
+    ) -> bool:
+        if self.conversation_mode is not ConversationMode.INTERPRETATION:
+            return False
+        if self.policy_engine is None:
+            return False
+        session = self.interpretation_session
+        request = PolicyRequest(
+            state=self.session_state,
+            assistant_last_text=self._assistant_last_text,
+            unplayed_text_summary=self._unplayed_text_summary(),
+            user_transcript=transcript,
+            candidate=candidate,
+            source_language=session.source_language if session is not None else None,
+            target_language=session.target_language if session is not None else None,
+        )
+        decision = await self.policy_engine.decide(request)
+        if decision.action is not PolicyAction.MODE_SWITCH:
+            return False
+        actions = self.controller.apply_policy(self.session_state, decision)
+        if actions:
+            await self.apply_controller_actions(actions)
+        self._turn_control_consumed = True
+        return True
 
     async def _turn_transcript_snapshot(self) -> TranscriptChunk | None:
         async with self._turn_transcript_lock:
@@ -644,6 +678,7 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
             self._turn_transcript_text = ""
             self._turn_latest_transcript = None
             self._turn_transcript_revision = -1
+            self._turn_control_consumed = False
 
     async def _finalize_turn_transcript(
         self, transcript: TranscriptChunk | None
@@ -664,6 +699,8 @@ class ServerRealtimeSessionRuntime(RealtimeSessionRuntime):
         candidate: Any,
         transcript: TranscriptChunk | None,
     ) -> None:
+        if self._turn_control_consumed:
+            return
         if self.conversation_mode is ConversationMode.INTERPRETATION:
             return
         if transcript is None and candidate.event != "USER_BACKCHANNEL_CANDIDATE":
